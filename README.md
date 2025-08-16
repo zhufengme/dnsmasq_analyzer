@@ -15,6 +15,7 @@
 - 🧹 **自动数据清理** - 防止数据文件无限制增长，可配置保留期限
 - 🔄 **幂等性执行** - 支持任意间隔的重复运行，不会重复统计
 - 🏆 **历史数据汇总** - 展示最近7天的域名访问排行榜
+- 🚫 **智能过滤** - 默认排除.arpa反向DNS查询，专注有意义的域名统计
 - 🎨 **美观的HTML报告** - 响应式设计，支持移动端查看
 
 ## 📋 系统要求
@@ -40,13 +41,16 @@ python3 dnsmasq_analyzer.py --log /path/to/dnsmasq.log
 
 # 自定义输出文件和数据保留期
 python3 dnsmasq_analyzer.py --output my_report.html --keep-days 7
+
+# 包含.arpa反向DNS查询（默认排除）
+python3 dnsmasq_analyzer.py --include-arpa
 ```
 
 ### 命令行参数
 
 ```
 用法: dnsmasq_analyzer.py [-h] [-l LOG] [-o OUTPUT] [-d DATA_DIR] 
-                         [--keep-days KEEP_DAYS] [--cleanup-only]
+                         [--keep-days KEEP_DAYS] [--cleanup-only] [--include-arpa]
 
 选项:
   -h, --help            显示帮助信息并退出
@@ -57,6 +61,7 @@ python3 dnsmasq_analyzer.py --output my_report.html --keep-days 7
                         历史数据存储目录 (默认: ./dnsmasq_data)
   --keep-days KEEP_DAYS 数据文件保留天数 (默认: 30天)
   --cleanup-only        仅执行数据清理，不进行日志分析
+  --include-arpa        包含.arpa域名查询 (默认排除反向DNS查询)
 ```
 
 ## 🔧 自动化部署
@@ -116,6 +121,7 @@ dnsmasq_data/
 - 缓存命中率统计
 - 上游DNS服务器使用情况（包含端口号）
 - TOP 100域名列表
+- 排除的.arpa查询数量统计
 
 ### 自动数据清理
 
@@ -160,6 +166,30 @@ python3 dnsmasq_analyzer.py --cleanup-only --keep-days 7
 - **7天高频域名TOP 50** - 基于历史数据的长期访问趋势
 
 ## ⚙️ 高级配置
+
+### .arpa域名过滤
+
+**什么是.arpa域名？**
+- `.arpa`域名用于反向DNS解析，将IP地址转换为域名
+- `in-addr.arpa`：IPv4反向解析（如：`100.1.168.192.in-addr.arpa`）
+- `ip6.arpa`：IPv6反向解析（如：`1.0.0.0...ip6.arpa`）
+
+**为什么要过滤？**
+- 反向DNS查询通常非常频繁，但对域名访问统计分析意义不大
+- 过滤后可以更专注于用户真正访问的网站域名统计
+
+**使用方式：**
+```bash
+# 默认排除.arpa域名（推荐）
+python3 dnsmasq_analyzer.py
+
+# 包含.arpa域名进行完整统计
+python3 dnsmasq_analyzer.py --include-arpa
+```
+
+**统计显示：**
+- 排除模式下会显示被排除的.arpa查询数量
+- 统计数据中的`arpa_queries_excluded`字段记录排除的查询数
 
 ### 支持的DNSmasq日志格式
 

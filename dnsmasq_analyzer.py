@@ -10,11 +10,12 @@ import argparse
 import sys
 
 class DnsmasqAnalyzer:
-    def __init__(self, log_file='/var/log/dnsmasq.log', data_dir='./dnsmasq_data', keep_days=30):
+    def __init__(self, log_file='/var/log/dnsmasq.log', data_dir='./dnsmasq_data', keep_days=30, exclude_arpa=True):
         self.log_file = log_file
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
         self.keep_days = keep_days  # 保留天数，默认30天
+        self.exclude_arpa = exclude_arpa  # 是否排除.arpa域名
         
         # 状态文件，记录上次处理的位置
         self.state_file = self.data_dir / '.last_processed_state.json'
@@ -55,11 +56,16 @@ class DnsmasqAnalyzer:
             'forwarded_domains': Counter(),
             'upstream_servers': Counter(),
             'hourly_cache_stats': defaultdict(lambda: {'hits': 0, 'misses': 0}),
-            'processed_lines': set()  # 用于去重
+            'processed_lines': set(),  # 用于去重
+            'arpa_queries_excluded': 0  # 排除的.arpa查询数量
         }
         
         # 加载今天已有的数据（如果存在）
         self.load_existing_data()
+        
+    def is_arpa_domain(self, domain):
+        """检查是否为.arpa域名（反向DNS查询）"""
+        return domain.endswith('.arpa')
         
     def parse_log_line(self, line):
         """解析单行日志"""
@@ -157,6 +163,7 @@ class DnsmasqAnalyzer:
                 # 恢复已有的统计数据
                 self.today_data['cache_hits'] = existing_data.get('cache_hits', 0)
                 self.today_data['cache_misses'] = existing_data.get('cache_misses', 0)
+                self.today_data['arpa_queries_excluded'] = existing_data.get('arpa_queries_excluded', 0)
                 self.today_data['domain_counts'].update(existing_data.get('domain_counts', {}))
                 self.today_data['query_types'].update(existing_data.get('query_types', {}))
                 self.today_data['client_ips'].update(existing_data.get('client_ips', {}))
@@ -211,24 +218,36 @@ class DnsmasqAnalyzer:
                         
                         # 处理查询记录
                         if data['type'] == 'query':
-                            self.today_data['queries'].append(data)
-                            self.today_data['domain_counts'][data['domain']] += 1
-                            self.today_data['query_types'][data['query_type']] += 1
-                            self.today_data['client_ips'][data['client_ip']] += 1
-                            self.today_data['hourly_stats'][data['hour']] += 1
+                            # 检查是否为.arpa域名并根据设置决定是否排除
+                            if self.exclude_arpa and self.is_arpa_domain(data['domain']):
+                                self.today_data['arpa_queries_excluded'] += 1
+                            else:
+                                self.today_data['queries'].append(data)
+                                self.today_data['domain_counts'][data['domain']] += 1
+                                self.today_data['query_types'][data['query_type']] += 1
+                                self.today_data['client_ips'][data['client_ip']] += 1
+                                self.today_data['hourly_stats'][data['hour']] += 1
                         
                         # 处理缓存命中记录
                         elif data['type'] == 'cache_hit':
-                            self.today_data['cache_hits'] += 1
-                            self.today_data['cached_domains'][data['domain']] += 1
-                            self.today_data['hourly_cache_stats'][data['hour']]['hits'] += 1
+                            # 检查是否为.arpa域名并根据设置决定是否排除
+                            if self.exclude_arpa and self.is_arpa_domain(data['domain']):
+                                self.today_data['arpa_queries_excluded'] += 1
+                            else:
+                                self.today_data['cache_hits'] += 1
+                                self.today_data['cached_domains'][data['domain']] += 1
+                                self.today_data['hourly_cache_stats'][data['hour']]['hits'] += 1
                         
                         # 处理转发记录（缓存未命中）
                         elif data['type'] == 'forward':
-                            self.today_data['cache_misses'] += 1
-                            self.today_data['forwarded_domains'][data['domain']] += 1
-                            self.today_data['upstream_servers'][data['upstream']] += 1
-                            self.today_data['hourly_cache_stats'][data['hour']]['misses'] += 1
+                            # 检查是否为.arpa域名并根据设置决定是否排除
+                            if self.exclude_arpa and self.is_arpa_domain(data['domain']):
+                                self.today_data['arpa_queries_excluded'] += 1
+                            else:
+                                self.today_data['cache_misses'] += 1
+                                self.today_data['forwarded_domains'][data['domain']] += 1
+                                self.today_data['upstream_servers'][data['upstream']] += 1
+                                self.today_data['hourly_cache_stats'][data['hour']]['misses'] += 1
             
             # 清理过期的行哈希记录
             self.cleanup_processed_lines_hash()
@@ -243,6 +262,8 @@ class DnsmasqAnalyzer:
             print(f"\n统计结果:")
             print(f"  新增记录: {new_records} 条")
             print(f"  跳过重复: {duplicate_records} 条")
+            if self.exclude_arpa:
+                print(f"  排除.arpa查询: {self.today_data['arpa_queries_excluded']} 条")
             print(f"  查询总数: {len(self.today_data['queries'])} 条")
             print(f"  缓存命中: {self.today_data['cache_hits']} 次")
             print(f"  缓存未命中: {self.today_data['cache_misses']} 次")
@@ -275,6 +296,7 @@ class DnsmasqAnalyzer:
         save_data = {
             'date': date_str,
             'total_queries': len(self.today_data['queries']),
+            'arpa_queries_excluded': self.today_data['arpa_queries_excluded'],
             'domain_counts': dict(self.today_data['domain_counts']),
             'query_types': dict(self.today_data['query_types']),
             'client_ips': dict(self.today_data['client_ips']),
@@ -869,6 +891,8 @@ def main():
                        help='数据文件保留天数 (默认: 30天)')
     parser.add_argument('--cleanup-only', action='store_true',
                        help='仅执行数据清理，不进行日志分析')
+    parser.add_argument('--include-arpa', action='store_true',
+                       help='包含.arpa域名查询 (默认排除反向DNS查询)')
     
     args = parser.parse_args()
     
@@ -876,7 +900,7 @@ def main():
     print("DNSmasq 日志分析工具")
     print("=" * 50)
     
-    analyzer = DnsmasqAnalyzer(log_file=args.log, data_dir=args.data_dir, keep_days=args.keep_days)
+    analyzer = DnsmasqAnalyzer(log_file=args.log, data_dir=args.data_dir, keep_days=args.keep_days, exclude_arpa=not args.include_arpa)
     
     # 如果只是清理模式
     if args.cleanup_only:
