@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(chmod:*)",
+      "Bash(rm:*)",
+      "Bash(grep:*)",
+      "Bash(./cleanup_data.sh:*)",
+      "WebFetch(domain:www.gnu.org)"
+    ],
+    "defaultMode": "acceptEdits"
+  }
+}

@@ -1,0 +1,24 @@
+# DNSmasq日志分析定时任务配置示例
+# 
+# 使用方法：
+# 1. 编辑此文件，选择合适的执行频率
+# 2. 运行 crontab -e 并将选中的配置复制进去
+# 3. 保存并退出
+
+# 每小时执行一次（每小时的第0分钟）
+0 * * * * /home/andie/dev/dnsmasq-analyzer/run_analysis.sh >> /var/log/dnsmasq_analyzer.log 2>&1
+
+# 每天凌晨2点执行
+# 0 2 * * * /home/andie/dev/dnsmasq-analyzer/run_analysis.sh >> /var/log/dnsmasq_analyzer.log 2>&1
+
+# 每天晚上11点55分执行（在日志轮转前保存数据）
+# 55 23 * * * /home/andie/dev/dnsmasq-analyzer/run_analysis.sh >> /var/log/dnsmasq_analyzer.log 2>&1
+
+# 每6小时执行一次
+# 0 */6 * * * /home/andie/dev/dnsmasq-analyzer/run_analysis.sh >> /var/log/dnsmasq_analyzer.log 2>&1
+
+# 每30分钟执行一次（高频监控）
+# */30 * * * * /home/andie/dev/dnsmasq-analyzer/run_analysis.sh >> /var/log/dnsmasq_analyzer.log 2>&1
+
+# 工作日每天下午6点执行
+# 0 18 * * 1-5 /home/andie/dev/dnsmasq-analyzer/run_analysis.sh >> /var/log/dnsmasq_analyzer.log 2>&1
