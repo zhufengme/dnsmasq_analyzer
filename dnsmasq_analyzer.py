@@ -60,28 +60,101 @@ class DnsmasqAnalyzer:
             'arpa_queries_excluded': 0  # 排除的.arpa查询数量
         }
         
+        # 数据恢复状态标志
+        self._data_restored = False
+        
         # 加载今天已有的数据（如果存在）
         self.load_existing_data()
         
     def is_arpa_domain(self, domain):
         """检查是否为.arpa域名（反向DNS查询）"""
         return domain.endswith('.arpa')
+    
+    def is_within_analysis_window(self, timestamp):
+        """智能的时间窗口检查，处理边界条件"""
+        now = datetime.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
         
+        # 检查是否在当天范围内（从今天00:00到现在）
+        if today_start <= timestamp <= now:
+            return True
+        
+        # 处理跨天情况：如果当前时间是凌晨，可能需要包含昨天晚上的日志
+        if now.hour < 2:  # 凌晨2点前
+            yesterday_22 = today_start - timedelta(hours=2)  # 昨天22点
+            if yesterday_22 <= timestamp < today_start:
+                return True
+        
+        # 扩展窗口：包含最近7天的数据（用于历史日志分析）
+        week_ago = today_start - timedelta(days=7)
+        if week_ago <= timestamp < today_start:
+            return True
+        
+        # 处理时间戳略微超前的情况（可能的系统时间差异），但不超过明天
+        if now < timestamp <= min(now + timedelta(minutes=10), tomorrow_start):
+            return True
+            
+        return False
+        
+    def parse_timestamp(self, timestamp_str):
+        """健壮的时间戳解析方法"""
+        current_year = datetime.now().year
+        now = datetime.now()
+        
+        # 尝试多种时间戳格式
+        timestamp_formats = [
+            # 不包含年份的格式（最常见）
+            "%b %d %H:%M:%S",                     # Aug 16 05:00:06
+            "%B %d %H:%M:%S",                     # August 16 05:00:06
+            # 包含年份的格式
+            "%Y %b %d %H:%M:%S",                  # 2025 Aug 16 05:00:06
+            "%Y %B %d %H:%M:%S",                  # 2025 August 16 05:00:06
+            "%Y-%m-%d %H:%M:%S",                  # 2025-08-16 05:00:06
+        ]
+        
+        for fmt in timestamp_formats:
+            try:
+                # 根据时间戳是否包含年份来决定处理方式
+                if timestamp_str.strip().startswith(('19', '20')):  # 包含年份
+                    parsed_time = datetime.strptime(timestamp_str, fmt)
+                else:  # 不包含年份，需要添加当前年份
+                    if "%Y" in fmt:
+                        # 跳过包含年份的格式，因为时间戳不包含年份
+                        continue
+                    # 解析不含年份的时间戳
+                    parsed_time = datetime.strptime(timestamp_str, fmt)
+                    # 手动添加年份
+                    parsed_time = parsed_time.replace(year=current_year)
+                
+                # 检查解析的时间是否合理（不超过当前时间太远）
+                time_diff = abs((now - parsed_time).total_seconds())
+                if time_diff > 366 * 24 * 3600:  # 超过一年
+                    # 尝试使用前一年
+                    try:
+                        adjusted_time = parsed_time.replace(year=current_year - 1)
+                        if abs((now - adjusted_time).total_seconds()) <= 366 * 24 * 3600:
+                            return adjusted_time
+                    except ValueError:
+                        pass
+                    # 如果调整年份后还是不合理，继续尝试其他格式
+                    continue
+                
+                return parsed_time
+            except ValueError:
+                continue
+        
+        # 最后的fallback：使用当前时间，但记录警告
+        print(f"警告：无法解析时间戳 '{timestamp_str}'，使用当前时间")
+        return now
+
     def parse_log_line(self, line):
         """解析单行日志"""
-        current_year = datetime.now().year
-        
         # 检查是否是查询记录
         match = self.log_pattern.search(line)
         if match:
             timestamp_str, query_type, domain, client_ip = match.groups()
-            
-            try:
-                # dnsmasq日志格式通常是: "Dec 30 12:30:45"
-                timestamp = datetime.strptime(f"{current_year} {timestamp_str}", "%Y %b %d %H:%M:%S")
-            except ValueError:
-                # 如果解析失败，使用当前时间
-                timestamp = datetime.now()
+            timestamp = self.parse_timestamp(timestamp_str)
             
             return {
                 'type': 'query',
@@ -96,11 +169,7 @@ class DnsmasqAnalyzer:
         cache_match = self.cache_pattern.search(line)
         if cache_match:
             timestamp_str, domain = cache_match.groups()
-            
-            try:
-                timestamp = datetime.strptime(f"{current_year} {timestamp_str}", "%Y %b %d %H:%M:%S")
-            except ValueError:
-                timestamp = datetime.now()
+            timestamp = self.parse_timestamp(timestamp_str)
             
             return {
                 'type': 'cache_hit',
@@ -113,11 +182,7 @@ class DnsmasqAnalyzer:
         forward_match = self.forward_pattern.search(line)
         if forward_match:
             timestamp_str, domain, upstream = forward_match.groups()
-            
-            try:
-                timestamp = datetime.strptime(f"{current_year} {timestamp_str}", "%Y %b %d %H:%M:%S")
-            except ValueError:
-                timestamp = datetime.now()
+            timestamp = self.parse_timestamp(timestamp_str)
             
             return {
                 'type': 'forward',
@@ -180,15 +245,31 @@ class DnsmasqAnalyzer:
                 # 恢复已处理的行哈希（用于去重）
                 if 'processed_lines_hash' in existing_data:
                     self.today_data['processed_lines'] = set(existing_data['processed_lines_hash'])
+                
+                # 根据总查询数重建queries列表（用于统计目的）
+                total_queries = existing_data.get('total_queries', 0)
+                self.today_data['queries'] = [{'type': 'query'}] * total_queries  # 简化的查询记录
+                
+                # 记录已恢复的状态，避免重复计算
+                self._data_restored = True
                     
                 print(f"已加载今天的现有数据，继续增量统计")
             except Exception as e:
                 print(f"加载现有数据失败: {e}")
     
     def get_line_hash(self, line):
-        """生成日志行的唯一标识符"""
+        """生成日志行的唯一标识符（包含时间戳和文件位置信息增强唯一性）"""
         import hashlib
-        return hashlib.md5(line.encode()).hexdigest()
+        
+        # 提取时间戳信息以增强唯一性
+        timestamp_info = ""
+        parsed_data = self.parse_log_line(line)
+        if parsed_data and 'timestamp' in parsed_data:
+            timestamp_info = parsed_data['timestamp'].isoformat()
+        
+        # 结合原始行内容、时间戳和行长度创建更强的唯一标识
+        unique_string = f"{line.strip()}|{timestamp_info}|{len(line)}"
+        return hashlib.sha256(unique_string.encode()).hexdigest()[:32]  # 使用SHA256并截取前32位
     
     def analyze_log(self):
         """分析日志文件"""
@@ -211,7 +292,7 @@ class DnsmasqAnalyzer:
                         continue
                     
                     data = self.parse_log_line(line)
-                    if data and datetime.now() - data['timestamp'] <= timedelta(hours=24):
+                    if data and self.is_within_analysis_window(data['timestamp']):
                         # 记录已处理的行
                         self.today_data['processed_lines'].add(line_hash)
                         new_records += 1
@@ -362,12 +443,16 @@ class DnsmasqAnalyzer:
     
     def cleanup_processed_lines_hash(self):
         """清理过期的已处理行哈希值，避免内存和存储空间过度占用"""
-        # 限制已处理行哈希的数量，保留最近的10000条记录
-        if len(self.today_data['processed_lines']) > 15000:
-            # 转换为列表，保留最新的10000条
+        # 更智能的清理策略：基于时间戳进行清理，而不是简单的数量限制
+        max_hash_count = 20000  # 增加哈希保留数量
+        cleanup_threshold = 25000  # 清理触发阈值
+        
+        if len(self.today_data['processed_lines']) > cleanup_threshold:
+            # 保留更多记录以提高幂等性可靠性
             hash_list = list(self.today_data['processed_lines'])
-            self.today_data['processed_lines'] = set(hash_list[-10000:])
-            print(f"已清理过期的行哈希记录，保留最近 10000 条")
+            self.today_data['processed_lines'] = set(hash_list[-max_hash_count:])
+            cleaned_count = len(hash_list) - max_hash_count
+            print(f"已清理 {cleaned_count} 条过期的行哈希记录，保留最近 {max_hash_count} 条")
     
     def get_data_directory_size(self):
         """获取数据目录的总大小"""
@@ -410,27 +495,43 @@ class DnsmasqAnalyzer:
         top_cached = self.today_data['cached_domains'].most_common(10)
         top_forwarded = self.today_data['forwarded_domains'].most_common(10)
         
-        # 加载7天的历史数据
+        # 加载7天的历史数据（不包括今天）
         historical_data = self.load_historical_data(7)
         
-        # 合并历史数据统计
+        # 合并历史数据统计（排除今天的数据，避免重复计算）
         all_time_domains = Counter()
         total_queries_7d = 0
         total_cache_hits_7d = 0
         total_cache_misses_7d = 0
+        # 7天累计的小时分布统计
+        hourly_stats_7d = defaultdict(int)
+        today_str = datetime.now().strftime('%Y-%m-%d')
         
         for data in historical_data:
+            # 跳过今天的数据，避免重复计算
+            if data.get('date') == today_str:
+                continue
+                
             if 'domain_counts' in data:
                 all_time_domains.update(data['domain_counts'])
                 total_queries_7d += data.get('total_queries', 0)
                 total_cache_hits_7d += data.get('cache_hits', 0)
                 total_cache_misses_7d += data.get('cache_misses', 0)
+                
+                # 累计每个小时的查询数据
+                hourly_data = data.get('hourly_stats', {})
+                for hour_str, count in hourly_data.items():
+                    hourly_stats_7d[int(hour_str)] += count
         
-        # 更新当天数据
+        # 添加当天数据（只添加一次）
         all_time_domains.update(self.today_data['domain_counts'])
         total_queries_7d += len(self.today_data['queries'])
         total_cache_hits_7d += self.today_data['cache_hits']
         total_cache_misses_7d += self.today_data['cache_misses']
+        
+        # 添加当天的小时统计数据
+        for hour, count in self.today_data['hourly_stats'].items():
+            hourly_stats_7d[hour] += count
         
         # 计算7天缓存命中率
         total_lookups_7d = total_cache_hits_7d + total_cache_misses_7d
@@ -738,15 +839,15 @@ class DnsmasqAnalyzer:
             </div>
             
             <div class="card">
-                <h2>📈 24小时查询时间分布</h2>
+                <h2>📈 7天累计24小时查询时间分布</h2>
                 <div class="chart-container">
                     <div class="hourly-chart">
 """
         
-        # 添加小时分布图
-        max_hourly = max(self.today_data['hourly_stats'].values()) if self.today_data['hourly_stats'] else 1
+        # 添加小时分布图（使用7天累计数据）
+        max_hourly = max(hourly_stats_7d.values()) if hourly_stats_7d else 1
         for hour in range(24):
-            count = self.today_data['hourly_stats'].get(hour, 0)
+            count = hourly_stats_7d.get(hour, 0)
             height_percent = (count / max_hourly * 100) if max_hourly > 0 else 0
             html_content += f"""
                         <div class="hour-bar" style="height: {height_percent}%;" data-hour="{hour:02d}" data-count="{count}"></div>
@@ -784,8 +885,8 @@ class DnsmasqAnalyzer:
                     <h3 style="color: #666; margin-bottom: 15px;">🔥 缓存命中最多的域名 TOP 10</h3>
                     <div class="domain-list" style="max-height: 300px;">
 """.format(
-            f"{max(self.today_data['hourly_stats'], key=self.today_data['hourly_stats'].get, default=0):02d}:00" if self.today_data['hourly_stats'] else "N/A",
-            f"{len(self.today_data['queries']) // 24:,}" if self.today_data['queries'] else "0",
+            f"{max(hourly_stats_7d, key=hourly_stats_7d.get, default=0):02d}:00" if hourly_stats_7d else "N/A",
+            f"{total_queries_7d // 24:,}" if total_queries_7d else "0",
             self.today_data['query_types'].most_common(1)[0][0] if self.today_data['query_types'] else "N/A",
             self.today_data['client_ips'].most_common(1)[0][0] if self.today_data['client_ips'] else "N/A"
         )
