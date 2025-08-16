@@ -9,7 +9,9 @@
       "WebFetch(domain:www.gnu.org)",
       "Bash(git add:*)",
       "Bash(git push:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(cp:*)",
+      "Bash(sqlite3:*)"
     ],
     "defaultMode": "acceptEdits",
     "additionalDirectories": [

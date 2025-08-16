@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import re
+import sqlite3
 import json
 import os
 from datetime import datetime, timedelta
@@ -18,6 +19,10 @@ class DnsmasqAnalyzer:
         self.data_dir.mkdir(exist_ok=True)
         self.keep_days = keep_days  # 保留天数，默认30天
         self.exclude_arpa = exclude_arpa  # 是否排除.arpa域名
+        
+        # SQLite 数据库配置
+        self.db_file = self.data_dir / 'dnsmasq_analysis.db'
+        self.init_database()
         
         # DeepSeek AI配置
         self.deepseek_api_key = self.load_deepseek_config()
@@ -48,30 +53,422 @@ class DnsmasqAnalyzer:
             r'(\w+\s+\d+\s+\d+:\d+:\d+).*?forwarded\s+([^\s]+)\s+to\s+([^\s]+(?:#\d+)?)'
         )
         
-        # 用于存储当天数据
-        self.today_data = {
-            'date': datetime.now().strftime('%Y-%m-%d'),
-            'queries': [],
-            'domain_counts': Counter(),
-            'query_types': Counter(),
-            'client_ips': Counter(),
-            'client_domains': defaultdict(Counter),  # 每个客户端的域名查询统计
-            'hourly_stats': defaultdict(int),
-            'cache_hits': 0,
-            'cache_misses': 0,
-            'cached_domains': Counter(),
-            'forwarded_domains': Counter(),
-            'upstream_servers': Counter(),
-            'hourly_cache_stats': defaultdict(lambda: {'hits': 0, 'misses': 0}),
-            'processed_lines': set(),  # 用于去重
-            'arpa_queries_excluded': 0  # 排除的.arpa查询数量
-        }
+    
+    def init_database(self):
+        """初始化 SQLite 数据库"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
         
-        # 数据恢复状态标志
-        self._data_restored = False
+        # 创建 DNS 查询记录表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dns_queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_hash TEXT UNIQUE NOT NULL,
+                timestamp DATETIME NOT NULL,
+                query_type TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                client_ip TEXT NOT NULL,
+                record_type TEXT NOT NULL,
+                date_only DATE NOT NULL,
+                hour INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         
-        # 加载今天已有的数据（如果存在）
-        self.load_existing_data()
+        # 创建缓存命中记录表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cache_hits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_hash TEXT UNIQUE NOT NULL,
+                timestamp DATETIME NOT NULL,
+                domain TEXT NOT NULL,
+                date_only DATE NOT NULL,
+                hour INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # 创建 DNS 转发记录表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dns_forwards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_hash TEXT UNIQUE NOT NULL,
+                timestamp DATETIME NOT NULL,
+                domain TEXT NOT NULL,
+                upstream_server TEXT NOT NULL,
+                date_only DATE NOT NULL,
+                hour INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # 创建索引提高查询性能
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_queries_date ON dns_queries(date_only)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_queries_domain ON dns_queries(domain)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_queries_client ON dns_queries(client_ip)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_queries_hour ON dns_queries(hour)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_queries_timestamp ON dns_queries(timestamp)')
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_date ON cache_hits(date_only)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_domain ON cache_hits(domain)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_hour ON cache_hits(hour)')
+        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_forwards_date ON dns_forwards(date_only)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_forwards_domain ON dns_forwards(domain)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_forwards_upstream ON dns_forwards(upstream_server)')
+        
+        conn.commit()
+        conn.close()
+        
+    def get_db_connection(self):
+        """获取数据库连接"""
+        return sqlite3.connect(self.db_file)
+    
+    def get_statistics_from_db(self, date_filter=None):
+        """从数据库获取统计数据"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        if date_filter is None:
+            date_filter = datetime.now().strftime('%Y-%m-%d')
+        
+        try:
+            # 查询总数
+            cursor.execute('SELECT COUNT(*) FROM dns_queries WHERE date_only = ?', (date_filter,))
+            total_queries = cursor.fetchone()[0]
+            
+            # 缓存命中数
+            cursor.execute('SELECT COUNT(*) FROM cache_hits WHERE date_only = ?', (date_filter,))
+            cache_hits = cursor.fetchone()[0]
+            
+            # 缓存未命中数（转发数）
+            cursor.execute('SELECT COUNT(*) FROM dns_forwards WHERE date_only = ?', (date_filter,))
+            cache_misses = cursor.fetchone()[0]
+            
+            # 计算缓存命中率
+            total_lookups = cache_hits + cache_misses
+            cache_hit_rate = (cache_hits / total_lookups * 100) if total_lookups > 0 else 0
+            
+            return {
+                'total_queries': total_queries,
+                'cache_hits': cache_hits,
+                'cache_misses': cache_misses,
+                'cache_hit_rate': cache_hit_rate,
+                'total_lookups': total_lookups
+            }
+        finally:
+            conn.close()
+    
+    def get_24h_statistics_from_db(self):
+        """获取过去24小时的真实统计数据"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        # 计算24小时前的时间
+        now = datetime.now()
+        hours_24_ago = now - timedelta(hours=24)
+        
+        try:
+            # 过去24小时的查询总数
+            cursor.execute('''
+                SELECT COUNT(*) FROM dns_queries 
+                WHERE timestamp >= ?
+            ''', (hours_24_ago,))
+            total_queries = cursor.fetchone()[0]
+            
+            # 过去24小时的缓存命中数
+            cursor.execute('''
+                SELECT COUNT(*) FROM cache_hits 
+                WHERE timestamp >= ?
+            ''', (hours_24_ago,))
+            cache_hits = cursor.fetchone()[0]
+            
+            # 过去24小时的缓存未命中数
+            cursor.execute('''
+                SELECT COUNT(*) FROM dns_forwards 
+                WHERE timestamp >= ?
+            ''', (hours_24_ago,))
+            cache_misses = cursor.fetchone()[0]
+            
+            # 计算缓存命中率
+            total_lookups = cache_hits + cache_misses
+            cache_hit_rate = (cache_hits / total_lookups * 100) if total_lookups > 0 else 0
+            
+            return {
+                'total_queries': total_queries,
+                'cache_hits': cache_hits,
+                'cache_misses': cache_misses,
+                'cache_hit_rate': cache_hit_rate,
+                'total_lookups': total_lookups
+            }
+        finally:
+            conn.close()
+    
+    def get_top_domains_from_db(self, date_filter=None, limit=50):
+        """从数据库获取高频域名"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        if date_filter is None:
+            date_filter = datetime.now().strftime('%Y-%m-%d')
+        
+        try:
+            cursor.execute('''
+                SELECT domain, COUNT(*) as count
+                FROM dns_queries 
+                WHERE date_only = ?
+                GROUP BY domain 
+                ORDER BY count DESC 
+                LIMIT ?
+            ''', (date_filter, limit))
+            
+            return cursor.fetchall()
+        finally:
+            conn.close()
+    
+    def get_top_domains_24h_from_db(self, limit=50):
+        """从数据库获取过去24小时的高频域名"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        # 计算24小时前的时间
+        now = datetime.now()
+        hours_24_ago = now - timedelta(hours=24)
+        
+        try:
+            cursor.execute('''
+                SELECT domain, COUNT(*) as count
+                FROM dns_queries 
+                WHERE timestamp >= ?
+                GROUP BY domain 
+                ORDER BY count DESC 
+                LIMIT ?
+            ''', (hours_24_ago, limit))
+            
+            return cursor.fetchall()
+        finally:
+            conn.close()
+    
+    def get_hourly_stats_from_db(self, days=1):
+        """从数据库获取按小时统计的数据"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=days-1)).strftime('%Y-%m-%d')
+        
+        try:
+            cursor.execute('''
+                SELECT hour, COUNT(*) as count
+                FROM dns_queries 
+                WHERE date_only BETWEEN ? AND ?
+                GROUP BY hour 
+                ORDER BY hour
+            ''', (start_date, end_date))
+            
+            # 转换为字典格式
+            hourly_stats = {}
+            for hour, count in cursor.fetchall():
+                hourly_stats[hour] = count
+            
+            return hourly_stats
+        finally:
+            conn.close()
+    
+    def get_client_stats_from_db(self, date_filter=None, limit=6):
+        """从数据库获取客户端统计数据"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        if date_filter is None:
+            date_filter = datetime.now().strftime('%Y-%m-%d')
+        
+        try:
+            # 获取最活跃的客户端
+            cursor.execute('''
+                SELECT client_ip, COUNT(*) as count
+                FROM dns_queries 
+                WHERE date_only = ?
+                GROUP BY client_ip 
+                ORDER BY count DESC 
+                LIMIT ?
+            ''', (date_filter, limit))
+            
+            top_clients = cursor.fetchall()
+            
+            # 获取每个客户端的高频域名
+            result = []
+            for client_ip, total_queries in top_clients:
+                cursor.execute('''
+                    SELECT domain, COUNT(*) as count
+                    FROM dns_queries 
+                    WHERE date_only = ? AND client_ip = ?
+                    GROUP BY domain 
+                    ORDER BY count DESC 
+                    LIMIT 10
+                ''', (date_filter, client_ip))
+                
+                top_domains = cursor.fetchall()
+                result.append({
+                    'client_ip': client_ip,
+                    'total_queries': total_queries,
+                    'top_domains': top_domains
+                })
+            
+            return result
+        finally:
+            conn.close()
+    
+    def get_client_stats_24h_from_db(self, limit=6):
+        """从数据库获取过去24小时的客户端统计数据"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        # 计算24小时前的时间
+        now = datetime.now()
+        hours_24_ago = now - timedelta(hours=24)
+        
+        try:
+            # 获取最活跃的客户端
+            cursor.execute('''
+                SELECT client_ip, COUNT(*) as count
+                FROM dns_queries 
+                WHERE timestamp >= ?
+                GROUP BY client_ip 
+                ORDER BY count DESC 
+                LIMIT ?
+            ''', (hours_24_ago, limit))
+            
+            top_clients = cursor.fetchall()
+            
+            # 获取每个客户端的高频域名
+            result = []
+            for client_ip, total_queries in top_clients:
+                cursor.execute('''
+                    SELECT domain, COUNT(*) as count
+                    FROM dns_queries 
+                    WHERE timestamp >= ? AND client_ip = ?
+                    GROUP BY domain 
+                    ORDER BY count DESC 
+                    LIMIT 10
+                ''', (hours_24_ago, client_ip))
+                
+                top_domains = cursor.fetchall()
+                result.append({
+                    'client_ip': client_ip,
+                    'total_queries': total_queries,
+                    'top_domains': top_domains
+                })
+            
+            return result
+        finally:
+            conn.close()
+    
+    def get_cache_stats_from_db(self, date_filter=None, limit=10):
+        """从数据库获取缓存统计数据"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        if date_filter is None:
+            date_filter = datetime.now().strftime('%Y-%m-%d')
+        
+        try:
+            # 获取缓存命中最多的域名
+            cursor.execute('''
+                SELECT domain, COUNT(*) as count
+                FROM cache_hits 
+                WHERE date_only = ?
+                GROUP BY domain 
+                ORDER BY count DESC 
+                LIMIT ?
+            ''', (date_filter, limit))
+            top_cached = cursor.fetchall()
+            
+            # 获取转发最多的域名
+            cursor.execute('''
+                SELECT domain, COUNT(*) as count
+                FROM dns_forwards 
+                WHERE date_only = ?
+                GROUP BY domain 
+                ORDER BY count DESC 
+                LIMIT ?
+            ''', (date_filter, limit))
+            top_forwarded = cursor.fetchall()
+            
+            # 获取上游服务器统计
+            cursor.execute('''
+                SELECT upstream_server, COUNT(*) as count
+                FROM dns_forwards 
+                WHERE date_only = ?
+                GROUP BY upstream_server 
+                ORDER BY count DESC 
+                LIMIT ?
+            ''', (date_filter, limit))
+            upstream_servers = cursor.fetchall()
+            
+            return {
+                'top_cached': top_cached,
+                'top_forwarded': top_forwarded,
+                'upstream_servers': upstream_servers
+            }
+        finally:
+            conn.close()
+    
+    def get_multi_day_stats_from_db(self, days=7):
+        """从数据库获取多天统计数据"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=days-1)).strftime('%Y-%m-%d')
+        
+        try:
+            # 获取多天高频域名
+            cursor.execute('''
+                SELECT domain, COUNT(*) as count
+                FROM dns_queries 
+                WHERE date_only BETWEEN ? AND ?
+                GROUP BY domain 
+                ORDER BY count DESC 
+                LIMIT 50
+            ''', (start_date, end_date))
+            top_domains = cursor.fetchall()
+            
+            # 获取总统计
+            cursor.execute('''
+                SELECT COUNT(*) FROM dns_queries 
+                WHERE date_only BETWEEN ? AND ?
+            ''', (start_date, end_date))
+            total_queries = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM cache_hits 
+                WHERE date_only BETWEEN ? AND ?
+            ''', (start_date, end_date))
+            total_cache_hits = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM dns_forwards 
+                WHERE date_only BETWEEN ? AND ?
+            ''', (start_date, end_date))
+            total_cache_misses = cursor.fetchone()[0]
+            
+            # 获取按小时的统计
+            hourly_stats = self.get_hourly_stats_from_db(days)
+            
+            total_lookups = total_cache_hits + total_cache_misses
+            cache_hit_rate = (total_cache_hits / total_lookups * 100) if total_lookups > 0 else 0
+            
+            return {
+                'top_domains': top_domains,
+                'total_queries': total_queries,
+                'total_cache_hits': total_cache_hits,
+                'total_cache_misses': total_cache_misses,
+                'cache_hit_rate': cache_hit_rate,
+                'hourly_stats': hourly_stats
+            }
+        finally:
+            conn.close()
         
     def load_deepseek_config(self):
         """加载DeepSeek API配置"""
@@ -299,53 +696,6 @@ class DnsmasqAnalyzer:
         with open(self.state_file, 'w') as f:
             json.dump(state, f, indent=2)
     
-    def load_existing_data(self):
-        """加载今天已有的数据，避免重复统计"""
-        date_str = datetime.now().strftime('%Y-%m-%d')
-        data_file = self.data_dir / f"dns_data_{date_str}.json"
-        
-        if data_file.exists():
-            try:
-                with open(data_file, 'r') as f:
-                    existing_data = json.load(f)
-                    
-                # 恢复已有的统计数据
-                self.today_data['cache_hits'] = existing_data.get('cache_hits', 0)
-                self.today_data['cache_misses'] = existing_data.get('cache_misses', 0)
-                self.today_data['arpa_queries_excluded'] = existing_data.get('arpa_queries_excluded', 0)
-                self.today_data['domain_counts'].update(existing_data.get('domain_counts', {}))
-                self.today_data['query_types'].update(existing_data.get('query_types', {}))
-                self.today_data['client_ips'].update(existing_data.get('client_ips', {}))
-                self.today_data['cached_domains'].update(existing_data.get('cached_domains', {}))
-                self.today_data['forwarded_domains'].update(existing_data.get('forwarded_domains', {}))
-                self.today_data['upstream_servers'].update(existing_data.get('upstream_servers', {}))
-                
-                # 恢复客户端域名统计
-                client_domains_data = existing_data.get('client_domains', {})
-                for client_ip, domains in client_domains_data.items():
-                    self.today_data['client_domains'][client_ip].update(domains)
-                
-                # 恢复小时统计
-                for hour, stats in existing_data.get('hourly_cache_stats', {}).items():
-                    self.today_data['hourly_cache_stats'][int(hour)] = stats
-                for hour, count in existing_data.get('hourly_stats', {}).items():
-                    self.today_data['hourly_stats'][int(hour)] = count
-                    
-                # 恢复已处理的行哈希（用于去重）
-                if 'processed_lines_hash' in existing_data:
-                    self.today_data['processed_lines'] = set(existing_data['processed_lines_hash'])
-                
-                # 根据总查询数重建queries列表（用于统计目的）
-                total_queries = existing_data.get('total_queries', 0)
-                self.today_data['queries'] = [{'type': 'query'}] * total_queries  # 简化的查询记录
-                
-                # 记录已恢复的状态，避免重复计算
-                self._data_restored = True
-                    
-                print(f"已加载今天的现有数据，继续增量统计")
-            except Exception as e:
-                print(f"加载现有数据失败: {e}")
-    
     def get_line_hash(self, line):
         """生成日志行的唯一标识符（包含时间戳和文件位置信息增强唯一性）"""
         # 提取时间戳信息以增强唯一性
@@ -570,19 +920,27 @@ class DnsmasqAnalyzer:
         current_hour = now.hour
         last_hour = (now - timedelta(hours=1)).hour
         
+        # 从数据库获取当前数据
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        hourly_stats = self.get_hourly_stats_from_db(1)
+        
         # 分析最近1小时的查询突增
-        current_hour_queries = self.today_data['hourly_stats'].get(current_hour, 0)
-        last_hour_queries = self.today_data['hourly_stats'].get(last_hour, 0)
+        current_hour_queries = hourly_stats.get(current_hour, 0)
+        last_hour_queries = hourly_stats.get(last_hour, 0)
         
         # 获取最近24小时最活跃的域名
-        top_domains_24h = self.today_data['domain_counts'].most_common(20)
+        top_domains_24h = self.get_top_domains_24h_from_db(20)
         
-        # 获取查询量最高的5个客户端及其高频域名
-        top_clients_with_domains = self.get_top_clients_with_domains(5, 10)
+        # 获取查询量最高的6个客户端及其高频域名
+        top_clients_with_domains = self.get_client_stats_24h_from_db(6)
         
-        # 加载历史数据进行对比
-        historical_data = self.load_historical_data(7)
-        historical_averages = self.calculate_historical_averages(historical_data)
+        # 获取历史数据进行对比
+        multi_day_stats = self.get_multi_day_stats_from_db(7)
+        historical_averages = {
+            'avg_total_queries': multi_day_stats['total_queries'] / 7,
+            'avg_hourly': {h: c / 7 for h, c in multi_day_stats['hourly_stats'].items()},
+            'historical_days': 7
+        }
         
         # 构建分析提示
         prompt = self.build_analysis_prompt(
@@ -602,47 +960,12 @@ class DnsmasqAnalyzer:
                     "current_hour_queries": current_hour_queries,
                     "last_hour_queries": last_hour_queries,
                     "top_domains_count": len(top_domains_24h),
-                    "total_domains_24h": len(self.today_data['domain_counts'])
+                    "total_domains_24h": len(top_domains_24h)
                 }
             }
         else:
             return {"status": "api_error", "message": "AI分析调用失败"}
     
-    def calculate_historical_averages(self, historical_data):
-        """计算历史数据平均值"""
-        if not historical_data:
-            return {}
-        
-        total_queries = []
-        hourly_averages = defaultdict(list)
-        domain_averages = defaultdict(list)
-        
-        for data in historical_data:
-            if data.get('date') != datetime.now().strftime('%Y-%m-%d'):  # 排除今天
-                total_queries.append(data.get('total_queries', 0))
-                
-                # 收集小时数据
-                hourly_data = data.get('hourly_stats', {})
-                for hour, count in hourly_data.items():
-                    hourly_averages[int(hour)].append(count)
-                
-                # 收集域名数据
-                domain_data = data.get('domain_counts', {})
-                for domain, count in domain_data.items():
-                    domain_averages[domain].append(count)
-        
-        # 计算平均值
-        avg_total = sum(total_queries) / len(total_queries) if total_queries else 0
-        
-        avg_hourly = {}
-        for hour, counts in hourly_averages.items():
-            avg_hourly[hour] = sum(counts) / len(counts) if counts else 0
-        
-        return {
-            'avg_total_queries': avg_total,
-            'avg_hourly': avg_hourly,
-            'historical_days': len(total_queries)
-        }
     
     def build_analysis_prompt(self, current_hour_queries, last_hour_queries, 
                             top_domains, historical_averages, current_hour, top_clients_with_domains=None):
@@ -682,7 +1005,7 @@ class DnsmasqAnalyzer:
         
         # 添加客户端域名分析数据
         if top_clients_with_domains:
-            prompt += f"\n最活跃的5个客户端及其高频域名：\n"
+            prompt += f"\n最活跃的6个客户端及其高频域名：\n"
             for i, client_data in enumerate(top_clients_with_domains, 1):
                 client_ip = client_data['client_ip']
                 total_queries = client_data['total_queries']
@@ -707,89 +1030,105 @@ class DnsmasqAnalyzer:
         return prompt
     
     def analyze_log(self):
-        """分析日志文件"""
+        """分析日志文件并写入数据库"""
         if not os.path.exists(self.log_file):
             print(f"日志文件 {self.log_file} 不存在")
             return False
         
         new_records = 0
         duplicate_records = 0
+        arpa_excluded = 0
+        
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
         
         try:
+            # 开始事务
+            conn.execute('BEGIN TRANSACTION')
+            
             with open(self.log_file, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
                     # 生成行的唯一标识
                     line_hash = self.get_line_hash(line.strip())
                     
-                    # 跳过已处理的行
-                    if line_hash in self.today_data['processed_lines']:
+                    # 检查是否已处理（查询数据库）
+                    cursor.execute('''
+                        SELECT 1 FROM dns_queries WHERE line_hash = ?
+                        UNION ALL
+                        SELECT 1 FROM cache_hits WHERE line_hash = ?
+                        UNION ALL
+                        SELECT 1 FROM dns_forwards WHERE line_hash = ?
+                        LIMIT 1
+                    ''', (line_hash, line_hash, line_hash))
+                    
+                    if cursor.fetchone():
                         duplicate_records += 1
                         continue
                     
                     data = self.parse_log_line(line)
                     if data and self.is_within_analysis_window(data['timestamp']):
-                        # 记录已处理的行
-                        self.today_data['processed_lines'].add(line_hash)
-                        new_records += 1
+                        # 检查是否为.arpa域名并根据设置决定是否排除
+                        if self.exclude_arpa and self.is_arpa_domain(data['domain']):
+                            arpa_excluded += 1
+                            continue
                         
-                        # 处理查询记录
-                        if data['type'] == 'query':
-                            # 检查是否为.arpa域名并根据设置决定是否排除
-                            if self.exclude_arpa and self.is_arpa_domain(data['domain']):
-                                self.today_data['arpa_queries_excluded'] += 1
-                            else:
-                                self.today_data['queries'].append(data)
-                                self.today_data['domain_counts'][data['domain']] += 1
-                                self.today_data['query_types'][data['query_type']] += 1
-                                self.today_data['client_ips'][data['client_ip']] += 1
-                                self.today_data['client_domains'][data['client_ip']][data['domain']] += 1
-                                self.today_data['hourly_stats'][data['hour']] += 1
+                        date_str = data['timestamp'].strftime('%Y-%m-%d')
+                        hour = data['timestamp'].hour
                         
-                        # 处理缓存命中记录
-                        elif data['type'] == 'cache_hit':
-                            # 检查是否为.arpa域名并根据设置决定是否排除
-                            if self.exclude_arpa and self.is_arpa_domain(data['domain']):
-                                self.today_data['arpa_queries_excluded'] += 1
-                            else:
-                                self.today_data['cache_hits'] += 1
-                                self.today_data['cached_domains'][data['domain']] += 1
-                                self.today_data['hourly_cache_stats'][data['hour']]['hits'] += 1
-                        
-                        # 处理转发记录（缓存未命中）
-                        elif data['type'] == 'forward':
-                            # 检查是否为.arpa域名并根据设置决定是否排除
-                            if self.exclude_arpa and self.is_arpa_domain(data['domain']):
-                                self.today_data['arpa_queries_excluded'] += 1
-                            else:
-                                self.today_data['cache_misses'] += 1
-                                self.today_data['forwarded_domains'][data['domain']] += 1
-                                self.today_data['upstream_servers'][data['upstream']] += 1
-                                self.today_data['hourly_cache_stats'][data['hour']]['misses'] += 1
+                        try:
+                            # 处理查询记录
+                            if data['type'] == 'query':
+                                cursor.execute('''
+                                    INSERT OR IGNORE INTO dns_queries 
+                                    (line_hash, timestamp, query_type, domain, client_ip, record_type, date_only, hour)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                ''', (line_hash, data['timestamp'], data['type'], data['domain'], 
+                                      data['client_ip'], data['query_type'], date_str, hour))
+                                
+                            # 处理缓存命中记录
+                            elif data['type'] == 'cache_hit':
+                                cursor.execute('''
+                                    INSERT OR IGNORE INTO cache_hits 
+                                    (line_hash, timestamp, domain, date_only, hour)
+                                    VALUES (?, ?, ?, ?, ?)
+                                ''', (line_hash, data['timestamp'], data['domain'], date_str, hour))
+                                
+                            # 处理转发记录（缓存未命中）
+                            elif data['type'] == 'forward':
+                                cursor.execute('''
+                                    INSERT OR IGNORE INTO dns_forwards 
+                                    (line_hash, timestamp, domain, upstream_server, date_only, hour)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                ''', (line_hash, data['timestamp'], data['domain'], 
+                                      data['upstream'], date_str, hour))
+                            
+                            if cursor.rowcount > 0:
+                                new_records += 1
+                                
+                        except sqlite3.IntegrityError:
+                            # 重复记录，忽略
+                            duplicate_records += 1
+                            continue
             
-            # 清理过期的行哈希记录
-            self.cleanup_processed_lines_hash()
+            # 提交事务
+            conn.commit()
             
-            # 计算缓存命中率
-            total_lookups = self.today_data['cache_hits'] + self.today_data['cache_misses']
-            if total_lookups > 0:
-                cache_hit_rate = (self.today_data['cache_hits'] / total_lookups) * 100
-            else:
-                cache_hit_rate = 0
+            # 获取统计数据
+            stats = self.get_statistics_from_db()
             
             print(f"\n统计结果:")
             print(f"  新增记录: {new_records} 条")
             print(f"  跳过重复: {duplicate_records} 条")
             if self.exclude_arpa:
-                print(f"  排除.arpa查询: {self.today_data['arpa_queries_excluded']} 条")
-            print(f"  查询总数: {len(self.today_data['queries'])} 条")
-            print(f"  缓存命中: {self.today_data['cache_hits']} 次")
-            print(f"  缓存未命中: {self.today_data['cache_misses']} 次")
-            print(f"  缓存命中率: {cache_hit_rate:.2f}%")
+                print(f"  排除.arpa查询: {arpa_excluded} 条")
+            print(f"  查询总数: {stats['total_queries']} 条")
+            print(f"  缓存命中: {stats['cache_hits']} 次")
+            print(f"  缓存未命中: {stats['cache_misses']} 次")
+            print(f"  缓存命中率: {stats['cache_hit_rate']:.2f}%")
             
-            # 显示数据目录状态
-            total_size, file_count = self.get_data_directory_size()
-            size_mb = total_size / 1024 / 1024
-            print(f"  数据目录状态: {file_count} 个文件，总大小 {size_mb:.2f} MB")
+            # 显示数据库状态
+            db_size = os.path.getsize(self.db_file) / 1024 / 1024
+            print(f"  数据库大小: {db_size:.2f} MB")
             
             # 保存处理状态
             self.save_state()
@@ -797,207 +1136,93 @@ class DnsmasqAnalyzer:
             return True
             
         except Exception as e:
-            print(f"读取日志文件出错: {e}")
+            # 回滚事务
+            conn.rollback()
+            print(f"分析日志文件出错: {e}")
             return False
+        finally:
+            conn.close()
     
-    def save_daily_data(self):
-        """保存当天数据到JSON文件"""
-        date_str = datetime.now().strftime('%Y-%m-%d')
-        data_file = self.data_dir / f"dns_data_{date_str}.json"
-        
-        # 计算缓存命中率
-        total_lookups = self.today_data['cache_hits'] + self.today_data['cache_misses']
-        cache_hit_rate = (self.today_data['cache_hits'] / total_lookups * 100) if total_lookups > 0 else 0
-        
-        # 准备要保存的数据
-        save_data = {
-            'date': date_str,
-            'total_queries': len(self.today_data['queries']),
-            'arpa_queries_excluded': self.today_data['arpa_queries_excluded'],
-            'domain_counts': dict(self.today_data['domain_counts']),
-            'query_types': dict(self.today_data['query_types']),
-            'client_ips': dict(self.today_data['client_ips']),
-            'client_domains': {ip: dict(domains) for ip, domains in self.today_data['client_domains'].items()},
-            'hourly_stats': dict(self.today_data['hourly_stats']),
-            'top_domains': dict(self.today_data['domain_counts'].most_common(100)),
-            'cache_hits': self.today_data['cache_hits'],
-            'cache_misses': self.today_data['cache_misses'],
-            'cache_hit_rate': cache_hit_rate,
-            'cached_domains': dict(self.today_data['cached_domains'].most_common(100)),
-            'forwarded_domains': dict(self.today_data['forwarded_domains'].most_common(100)),
-            'upstream_servers': dict(self.today_data['upstream_servers']),
-            'hourly_cache_stats': dict(self.today_data['hourly_cache_stats']),
-            # 保存已处理行的哈希值列表（限制大小避免文件过大）
-            'processed_lines_hash': list(self.today_data['processed_lines'])[-10000:] if len(self.today_data['processed_lines']) > 10000 else list(self.today_data['processed_lines']),
-            'last_update': datetime.now().isoformat()
-        }
-        
-        with open(data_file, 'w', encoding='utf-8') as f:
-            json.dump(save_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"数据已保存到 {data_file}")
-        
-        # 执行数据文件清理
-        self.cleanup_old_data()
     
     def cleanup_old_data(self):
-        """清理过期的数据文件"""
+        """清理过期的数据库记录"""
         try:
             current_time = datetime.now()
-            cleanup_count = 0
-            total_size_cleaned = 0
+            cutoff_date = (current_time - timedelta(days=self.keep_days)).strftime('%Y-%m-%d')
             
-            # 扫描数据目录中的所有json文件
-            for file_path in self.data_dir.glob("dns_data_*.json"):
-                try:
-                    # 从文件名提取日期
-                    file_name = file_path.stem
-                    if file_name.startswith('dns_data_'):
-                        date_str = file_name.replace('dns_data_', '')
-                        file_date = datetime.strptime(date_str, '%Y-%m-%d')
-                        
-                        # 检查是否超过保留期限
-                        days_old = (current_time - file_date).days
-                        if days_old > self.keep_days:
-                            file_size = file_path.stat().st_size
-                            file_path.unlink()  # 删除文件
-                            cleanup_count += 1
-                            total_size_cleaned += file_size
-                            print(f"  已删除过期数据文件: {file_path.name} ({days_old}天前)")
-                            
-                except (ValueError, OSError) as e:
-                    print(f"  处理文件 {file_path.name} 时出错: {e}")
-                    continue
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
             
-            if cleanup_count > 0:
-                size_mb = total_size_cleaned / 1024 / 1024
-                print(f"数据清理完成: 删除了 {cleanup_count} 个文件，释放空间 {size_mb:.2f} MB")
-            else:
-                print(f"数据清理检查完成: 当前所有文件都在 {self.keep_days} 天保留期内")
+            # 删除过期记录
+            cursor.execute('DELETE FROM dns_queries WHERE date_only < ?', (cutoff_date,))
+            queries_deleted = cursor.rowcount
+            
+            cursor.execute('DELETE FROM cache_hits WHERE date_only < ?', (cutoff_date,))
+            cache_deleted = cursor.rowcount
+            
+            cursor.execute('DELETE FROM dns_forwards WHERE date_only < ?', (cutoff_date,))
+            forwards_deleted = cursor.rowcount
+            
+            conn.commit()
+            
+            total_deleted = queries_deleted + cache_deleted + forwards_deleted
+            if total_deleted > 0:
+                print(f"数据清理完成: 删除了 {total_deleted} 条过期记录 (超过 {self.keep_days} 天)")
+                print(f"  查询记录: {queries_deleted} 条")
+                print(f"  缓存记录: {cache_deleted} 条")
+                print(f"  转发记录: {forwards_deleted} 条")
                 
+                # 优化数据库
+                cursor.execute('VACUUM')
+                conn.commit()
+                print("数据库已优化")
+            else:
+                print(f"数据清理检查完成: 当前所有数据都在 {self.keep_days} 天保留期内")
+                
+            conn.close()
         except Exception as e:
             print(f"数据清理过程中出错: {e}")
     
-    def cleanup_processed_lines_hash(self):
-        """清理过期的已处理行哈希值，避免内存和存储空间过度占用"""
-        # 更智能的清理策略：基于时间戳进行清理，而不是简单的数量限制
-        max_hash_count = 20000  # 增加哈希保留数量
-        cleanup_threshold = 25000  # 清理触发阈值
-        
-        if len(self.today_data['processed_lines']) > cleanup_threshold:
-            # 保留更多记录以提高幂等性可靠性
-            hash_list = list(self.today_data['processed_lines'])
-            self.today_data['processed_lines'] = set(hash_list[-max_hash_count:])
-            cleaned_count = len(hash_list) - max_hash_count
-            print(f"已清理 {cleaned_count} 条过期的行哈希记录，保留最近 {max_hash_count} 条")
     
-    def get_data_directory_size(self):
-        """获取数据目录的总大小"""
-        total_size = 0
-        file_count = 0
-        
-        for file_path in self.data_dir.rglob('*'):
-            if file_path.is_file():
-                total_size += file_path.stat().st_size
-                file_count += 1
-        
-        return total_size, file_count
     
-    def get_top_clients_with_domains(self, top_clients_count=5, top_domains_count=10):
-        """获取查询量最高的客户端及其查询量最高的域名"""
-        # 获取查询量最高的客户端
-        top_clients = self.today_data['client_ips'].most_common(top_clients_count)
-        
-        result = []
-        for client_ip, total_queries in top_clients:
-            # 获取该客户端查询最高的域名
-            client_domains = self.today_data['client_domains'][client_ip]
-            top_domains = client_domains.most_common(top_domains_count)
-            
-            result.append({
-                'client_ip': client_ip,
-                'total_queries': total_queries,
-                'top_domains': top_domains
-            })
-        
-        return result
     
-    def load_historical_data(self, days=7):
-        """加载历史数据"""
-        historical_data = []
-        
-        for i in range(days):
-            date = datetime.now() - timedelta(days=i)
-            date_str = date.strftime('%Y-%m-%d')
-            data_file = self.data_dir / f"dns_data_{date_str}.json"
-            
-            if data_file.exists():
-                with open(data_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    historical_data.append(data)
-        
-        return historical_data
     
     def generate_html_report(self, output_file='dnsmasq_report.html'):
         """生成HTML分析报告"""
+        # 从数据库获取数据
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        
         # 获取最近24小时的TOP域名
-        top_domains_24h = self.today_data['domain_counts'].most_common(50)
+        top_domains_24h = self.get_top_domains_24h_from_db(50)
         
-        # 获取查询量最高的5个客户端及其TOP 10域名
-        top_clients_with_domains = self.get_top_clients_with_domains(5, 10)
+        # 获取查询量最高的6个客户端及其TOP 10域名
+        top_clients_with_domains = self.get_client_stats_24h_from_db(6)
         
-        # 计算缓存命中率
-        total_lookups = self.today_data['cache_hits'] + self.today_data['cache_misses']
-        cache_hit_rate = (self.today_data['cache_hits'] / total_lookups * 100) if total_lookups > 0 else 0
+        # 获取24小时和当天的统计数据
+        stats_24h = self.get_24h_statistics_from_db()
+        today_stats = self.get_statistics_from_db(today_str)
+        cache_hit_rate = stats_24h['cache_hit_rate']
         
-        # 获取缓存最多的域名
-        top_cached = self.today_data['cached_domains'].most_common(10)
-        top_forwarded = self.today_data['forwarded_domains'].most_common(10)
+        # 获取缓存统计数据
+        cache_stats = self.get_cache_stats_from_db(today_str, 10)
+        top_cached = cache_stats['top_cached']
+        top_forwarded = cache_stats['top_forwarded']
+        upstream_servers = cache_stats['upstream_servers']
         
         # 执行AI态势感知分析
         ai_analysis_result = self.analyze_dns_anomalies()
         
-        # 加载7天的历史数据（不包括今天）
-        historical_data = self.load_historical_data(7)
+        # 获取7天的统计数据
+        multi_day_stats = self.get_multi_day_stats_from_db(7)
+        all_time_domains = multi_day_stats['top_domains']
+        total_queries_7d = multi_day_stats['total_queries']
+        total_cache_hits_7d = multi_day_stats['total_cache_hits']
+        total_cache_misses_7d = multi_day_stats['total_cache_misses']
+        cache_hit_rate_7d = multi_day_stats['cache_hit_rate']
+        hourly_stats_7d = multi_day_stats['hourly_stats']
         
-        # 合并历史数据统计（排除今天的数据，避免重复计算）
-        all_time_domains = Counter()
-        total_queries_7d = 0
-        total_cache_hits_7d = 0
-        total_cache_misses_7d = 0
-        # 7天累计的小时分布统计
-        hourly_stats_7d = defaultdict(int)
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        
-        for data in historical_data:
-            # 跳过今天的数据，避免重复计算
-            if data.get('date') == today_str:
-                continue
-                
-            if 'domain_counts' in data:
-                all_time_domains.update(data['domain_counts'])
-                total_queries_7d += data.get('total_queries', 0)
-                total_cache_hits_7d += data.get('cache_hits', 0)
-                total_cache_misses_7d += data.get('cache_misses', 0)
-                
-                # 累计每个小时的查询数据
-                hourly_data = data.get('hourly_stats', {})
-                for hour_str, count in hourly_data.items():
-                    hourly_stats_7d[int(hour_str)] += count
-        
-        # 添加当天数据（只添加一次）
-        all_time_domains.update(self.today_data['domain_counts'])
-        total_queries_7d += len(self.today_data['queries'])
-        total_cache_hits_7d += self.today_data['cache_hits']
-        total_cache_misses_7d += self.today_data['cache_misses']
-        
-        # 添加当天的小时统计数据
-        for hour, count in self.today_data['hourly_stats'].items():
-            hourly_stats_7d[hour] += count
-        
-        # 计算7天缓存命中率
-        total_lookups_7d = total_cache_hits_7d + total_cache_misses_7d
-        cache_hit_rate_7d = (total_cache_hits_7d / total_lookups_7d * 100) if total_lookups_7d > 0 else 0
+        # 获取24小时的查询总数
+        h24_total_queries = stats_24h['total_queries']
         
         html_content = f"""
 <!DOCTYPE html>
@@ -1380,20 +1605,20 @@ class DnsmasqAnalyzer:
         <div class="stats-grid">
             <div class="stat-card">
                 <h3>24小时查询总数</h3>
-                <div class="value">{len(self.today_data['queries']):,}</div>
+                <div class="value">{h24_total_queries:,}</div>
             </div>
             <div class="stat-card">
                 <h3>24小时缓存命中率</h3>
                 <div class="value">{cache_hit_rate:.1f}%</div>
-                <div class="change">命中:{self.today_data['cache_hits']:,} / 未中:{self.today_data['cache_misses']:,}</div>
+                <div class="change">命中:{stats_24h['cache_hits']:,} / 未中:{stats_24h['cache_misses']:,}</div>
             </div>
             <div class="stat-card">
                 <h3>独立域名数</h3>
-                <div class="value">{len(self.today_data['domain_counts']):,}</div>
+                <div class="value">{len(top_domains_24h):,}</div>
             </div>
             <div class="stat-card">
                 <h3>活跃客户端</h3>
-                <div class="value">{len(self.today_data['client_ips']):,}</div>
+                <div class="value">{len(top_clients_with_domains):,}</div>
             </div>
             <div class="stat-card">
                 <h3>7天查询总数</h3>
@@ -1441,7 +1666,7 @@ class DnsmasqAnalyzer:
                         <div class="hour-bar" style="height: {height_percent}%;" data-hour="{hour:02d}" data-count="{count}"></div>
 """
         
-        html_content += """
+        html_content += ("""
                     </div>
                 </div>
                 
@@ -1455,7 +1680,7 @@ class DnsmasqAnalyzer:
                         <div class="value">{}</div>
                     </div>
                     <div class="info-item">
-                        <h4>最常见查询类型</h4>
+                        <h4>7天总查询</h4>
                         <div class="value">{}</div>
                     </div>
                     <div class="info-item">
@@ -1465,10 +1690,17 @@ class DnsmasqAnalyzer:
                 </div>
             </div>
         </div>
+        """).format(
+            f"{max(hourly_stats_7d, key=hourly_stats_7d.get, default=0):02d}:00" if hourly_stats_7d else "N/A",
+            f"{total_queries_7d // 24:,}" if total_queries_7d else "0",
+            f"{total_queries_7d:,}" if total_queries_7d else "0",
+            top_clients_with_domains[0]['client_ip'] if top_clients_with_domains else "N/A"
+        )
         
-        <!-- TOP 5 客户端及其高频域名 -->
+        # TOP 6 客户端及其高频域名
+        html_content += """
         <div class="card" style="grid-column: 1 / -1;">
-            <h2>🔥 查询量最高的5个客户端及其TOP 10域名</h2>
+            <h2>🔥 查询量最高的6个客户端及其TOP 10域名</h2>
             <div class="main-content" style="grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));">
 """
         
@@ -1517,12 +1749,7 @@ class DnsmasqAnalyzer:
                 <div>
                     <h3 style="color: #666; margin-bottom: 15px;">🔥 缓存命中最多的域名 TOP 10</h3>
                     <div class="domain-list" style="max-height: 300px;">
-""".format(
-            f"{max(hourly_stats_7d, key=hourly_stats_7d.get, default=0):02d}:00" if hourly_stats_7d else "N/A",
-            f"{total_queries_7d // 24:,}" if total_queries_7d else "0",
-            self.today_data['query_types'].most_common(1)[0][0] if self.today_data['query_types'] else "N/A",
-            self.today_data['client_ips'].most_common(1)[0][0] if self.today_data['client_ips'] else "N/A"
-        )
+"""
         
         # 添加缓存命中TOP域名
         for idx, (domain, count) in enumerate(top_cached, 1):
@@ -1564,7 +1791,7 @@ class DnsmasqAnalyzer:
 """
         
         # 添加上游服务器统计
-        for server, count in self.today_data['upstream_servers'].most_common(5):
+        for server, count in upstream_servers[:5]:
             html_content += f"                        {server}: {count:,} 次<br>"
         
         html_content += """
@@ -1586,7 +1813,7 @@ class DnsmasqAnalyzer:
             <div class="domain-list" style="column-count: 2; column-gap: 20px;">
 """
         
-        for idx, (domain, count) in enumerate(all_time_domains.most_common(50), 1):
+        for idx, (domain, count) in enumerate(all_time_domains, 1):
             html_content += f"""
                 <div class="domain-item" style="break-inside: avoid;">
                     <span class="domain-rank">{idx}</span>
@@ -1681,25 +1908,23 @@ def main():
     if args.cleanup_only:
         print(f"\n正在清理超过 {args.keep_days} 天的数据文件...")
         analyzer.cleanup_old_data()
-        total_size, file_count = analyzer.get_data_directory_size()
-        size_mb = total_size / 1024 / 1024
-        print(f"清理完成，当前数据目录: {file_count} 个文件，总大小 {size_mb:.2f} MB")
+        # 显示数据库大小
+        db_size = analyzer.db_file.stat().st_size / 1024 / 1024 if analyzer.db_file.exists() else 0
+        print(f"清理完成，当前数据库大小: {db_size:.2f} MB")
         return
     
     # 分析日志
     print("\n正在分析日志文件...")
     if analyzer.analyze_log():
-        # 保存数据
-        print("\n正在保存数据...")
-        analyzer.save_daily_data()
-        
         # 生成报告
         print("\n正在生成HTML报告...")
         analyzer.generate_html_report(output_file=args.output)
         
         print("\n✅ 分析完成!")
-        print(f"📊 共分析 {len(analyzer.today_data['queries'])} 条查询记录")
-        print(f"📁 历史数据保存在: {args.data_dir}")
+        # 获取今天的统计数据
+        today_stats = analyzer.get_statistics_from_db()
+        print(f"📊 共分析 {today_stats['total_queries']} 条查询记录")
+        print(f"📁 数据库保存在: {analyzer.db_file}")
         print(f"📄 HTML报告: {args.output}")
         
         # AI功能状态提示
