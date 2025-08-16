@@ -352,6 +352,159 @@ class DnsmasqAnalyzer:
         unique_string = f"{line.strip()}|{timestamp_info}|{len(line)}"
         return hashlib.sha256(unique_string.encode()).hexdigest()[:32]  # 使用SHA256并截取前32位
     
+    def markdown_to_html(self, markdown_text):
+        """将markdown文本转换为HTML格式"""
+        if not markdown_text:
+            return ""
+        
+        # 转义HTML特殊字符（但保留换行符用于后续处理）
+        html_text = markdown_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        
+        # 先处理代码块和行内代码，避免被其他规则干扰
+        # 处理代码块 ```
+        html_text = re.sub(r'```(\w+)?\n(.*?)\n```', 
+                          r'<pre><code>\2</code></pre>', 
+                          html_text, flags=re.DOTALL)
+        
+        # 处理行内代码 `code` (避免与粗体斜体冲突)
+        html_text = re.sub(r'`([^`]+)`', r'<code>\1</code>', html_text)
+        
+        # 处理粗体 **text** 或 __text__
+        html_text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', html_text)
+        html_text = re.sub(r'__(.*?)__', r'<strong>\1</strong>', html_text)
+        
+        # 处理斜体 *text* 或 _text_ (注意避免与列表冲突)
+        html_text = re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'<em>\1</em>', html_text)
+        html_text = re.sub(r'(?<!_)_([^_\n]+)_(?!_)', r'<em>\1</em>', html_text)
+        
+        # 按段落分割处理
+        paragraphs = html_text.split('\n\n')
+        processed_paragraphs = []
+        
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+                
+            lines = para.split('\n')
+            processed_lines = []
+            in_list = False
+            list_items = []
+            
+            current_list_type = None  # 'ul' for unordered, 'ol' for ordered
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # 处理标题
+                if line.startswith('####'):
+                    if in_list:
+                        list_tag = current_list_type or 'ul'
+                        processed_lines.append(f'<{list_tag}>{"".join(list_items)}</{list_tag}>')
+                        list_items = []
+                        in_list = False
+                        current_list_type = None
+                    processed_lines.append(f'<h4>{line[4:].strip()}</h4>')
+                elif line.startswith('###'):
+                    if in_list:
+                        list_tag = current_list_type or 'ul'
+                        processed_lines.append(f'<{list_tag}>{"".join(list_items)}</{list_tag}>')
+                        list_items = []
+                        in_list = False
+                        current_list_type = None
+                    processed_lines.append(f'<h3>{line[3:].strip()}</h3>')
+                elif line.startswith('##'):
+                    if in_list:
+                        list_tag = current_list_type or 'ul'
+                        processed_lines.append(f'<{list_tag}>{"".join(list_items)}</{list_tag}>')
+                        list_items = []
+                        in_list = False
+                        current_list_type = None
+                    processed_lines.append(f'<h2>{line[2:].strip()}</h2>')
+                elif line.startswith('#'):
+                    if in_list:
+                        list_tag = current_list_type or 'ul'
+                        processed_lines.append(f'<{list_tag}>{"".join(list_items)}</{list_tag}>')
+                        list_items = []
+                        in_list = False
+                        current_list_type = None
+                    processed_lines.append(f'<h1>{line[1:].strip()}</h1>')
+                
+                # 处理无序列表项
+                elif line.startswith('- ') or line.startswith('* '):
+                    if in_list and current_list_type == 'ol':
+                        # 如果前面是有序列表，先关闭
+                        processed_lines.append(f'<ol>{"".join(list_items)}</ol>')
+                        list_items = []
+                    content = line[2:].strip()
+                    list_items.append(f'<li>{content}</li>')
+                    in_list = True
+                    current_list_type = 'ul'
+                
+                # 处理有序列表项 - 修复问题：支持更灵活的有序列表格式
+                elif re.match(r'^\d+[\.\)]\s+', line):
+                    if in_list and current_list_type == 'ul':
+                        # 如果前面是无序列表，先关闭
+                        processed_lines.append(f'<ul>{"".join(list_items)}</ul>')
+                        list_items = []
+                    # 移除数字和标点符号（点号或括号）
+                    content = re.sub(r'^\d+[\.\)]\s+', '', line)
+                    list_items.append(f'<li>{content}</li>')
+                    in_list = True
+                    current_list_type = 'ol'
+                
+                # 普通文本行
+                else:
+                    if in_list:
+                        list_tag = current_list_type or 'ul'
+                        processed_lines.append(f'<{list_tag}>{"".join(list_items)}</{list_tag}>')
+                        list_items = []
+                        in_list = False
+                        current_list_type = None
+                    processed_lines.append(line)
+            
+            # 处理段落结束时的列表
+            if in_list and list_items:
+                list_tag = current_list_type or 'ul'
+                processed_lines.append(f'<{list_tag}>{"".join(list_items)}</{list_tag}>')
+            
+            # 将非HTML标签的连续行包装为段落
+            if processed_lines:
+                para_content = '\n'.join(processed_lines)
+                
+                # 分离HTML标签和普通文本
+                html_elements = []
+                current_text = []
+                
+                for line in processed_lines:
+                    if re.match(r'^\s*<(?:h[1-6]|ul|ol|pre)', line):
+                        # 如果之前有普通文本，包装为段落
+                        if current_text:
+                            text_content = ' '.join(current_text)
+                            html_elements.append(f'<p>{text_content}</p>')
+                            current_text = []
+                        html_elements.append(line)
+                    else:
+                        current_text.append(line)
+                
+                # 处理剩余的普通文本
+                if current_text:
+                    text_content = ' '.join(current_text)
+                    html_elements.append(f'<p>{text_content}</p>')
+                
+                processed_paragraphs.extend(html_elements)
+        
+        # 组合结果
+        result = '\n'.join(processed_paragraphs)
+        
+        # 清理多余的空白和换行
+        result = re.sub(r'\n\s*\n', '\n', result)
+        result = result.strip()
+        
+        return result
+
     def call_deepseek_api(self, prompt, max_tokens=1000):
         """调用DeepSeek API进行AI分析"""
         if not self.deepseek_api_key:
@@ -367,7 +520,7 @@ class DnsmasqAnalyzer:
             'messages': [
                 {
                     'role': 'system',
-                    'content': '你是一个专业的网络安全分析师，专门分析DNS查询日志，识别异常行为和潜在威胁。请用中文回答，语言简洁明了。'
+                    'content': '你是一个专业的网络安全分析师，专门分析DNS查询日志，识别异常行为和潜在威胁。请用中文回答，语言简洁明了。请严格按照以下要求输出纯文本内容：\n- 只输出纯文本，不使用任何markdown格式符号\n- 不使用 #、*、-、[] 等markdown标记\n- 使用阿拉伯数字和中文标点符号进行结构化输出\n- 重要内容可以用中文描述词强调，如"重点关注"、"需要注意"\n- 保持内容简洁明了，避免格式混乱'
                 },
                 {
                     'role': 'user',
@@ -525,7 +678,7 @@ class DnsmasqAnalyzer:
 3. 可能的安全风险或异常行为
 4. 简要的安全建议
 
-请用简洁的中文回答，重点突出异常情况和安全关注点。如果一切正常，请说明当前网络活动正常。
+请用简洁的中文回答，重点突出异常情况和安全关注点。如果一切正常，请说明当前网络活动正常。请使用纯文本格式输出，便于直接显示。
 """
         
         return prompt
@@ -867,7 +1020,70 @@ class DnsmasqAnalyzer:
             border-radius: 10px;
             padding: 20px;
             line-height: 1.6;
-            white-space: pre-wrap;
+        }}
+        
+        .ai-analysis .content h1, .ai-analysis .content h2, .ai-analysis .content h3, .ai-analysis .content h4 {{
+            color: #d63384;
+            margin: 15px 0 10px 0;
+            font-weight: bold;
+        }}
+        
+        .ai-analysis .content h1 {{ font-size: 1.4em; }}
+        .ai-analysis .content h2 {{ font-size: 1.3em; }}
+        .ai-analysis .content h3 {{ font-size: 1.2em; }}
+        .ai-analysis .content h4 {{ font-size: 1.1em; }}
+        
+        .ai-analysis .content p {{
+            margin: 10px 0;
+            text-align: justify;
+        }}
+        
+        .ai-analysis .content ul, .ai-analysis .content ol {{
+            margin: 10px 0;
+            padding-left: 20px;
+        }}
+        
+        .ai-analysis .content li {{
+            margin: 5px 0;
+            list-style-type: disc;
+        }}
+        
+        .ai-analysis .content ol li {{
+            list-style-type: decimal;
+        }}
+        
+        .ai-analysis .content strong {{
+            color: #d63384;
+            font-weight: bold;
+        }}
+        
+        .ai-analysis .content em {{
+            font-style: italic;
+            color: #666;
+        }}
+        
+        .ai-analysis .content code {{
+            background: rgba(233, 236, 239, 0.8);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            color: #e83e8c;
+        }}
+        
+        .ai-analysis .content pre {{
+            background: rgba(233, 236, 239, 0.8);
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
+            overflow-x: auto;
+        }}
+        
+        .ai-analysis .content pre code {{
+            background: none;
+            padding: 0;
+            font-size: 0.9em;
+            color: #333;
         }}
         
         .ai-analysis .no-analysis {{
@@ -1094,8 +1310,10 @@ class DnsmasqAnalyzer:
             <h2>🤖 AI态势感知分析</h2>"""
 
         if ai_analysis_result['status'] == 'success':
+            # 处理纯文本格式的AI分析结果
+            analysis_text = ai_analysis_result['analysis'].replace('\n', '<br>')
             html_content += f"""
-            <div class="content">{ai_analysis_result['analysis']}</div>"""
+            <div class="content"><p>{analysis_text}</p></div>"""
         elif ai_analysis_result['status'] == 'no_api_key':
             html_content += f"""
             <div class="no-analysis">
