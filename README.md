@@ -347,25 +347,7 @@ dnsmasq-analyzer/
 
 - **DNSmasq官方文档**：[http://www.thekelleys.org.uk/dnsmasq/doc.html](http://www.thekelleys.org.uk/dnsmasq/doc.html)
 - **DeepSeek AI平台**：[https://platform.deepseek.com/](https://platform.deepseek.com/)
-- **项目Github**：[https://github.com/your-username/dnsmasq-analyzer](https://github.com/your-username/dnsmasq-analyzer)
 
-## 🤝 贡献指南
-
-欢迎提交Issue和Pull Request！
-
-1. Fork 这个项目
-2. 创建您的特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交您的修改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 打开一个 Pull Request
-
-## 🆘 支持与反馈
-
-- 遇到问题？请查看 [故障排除](#-故障排除) 部分
-- 仍有疑问？请提交 [GitHub Issue](https://github.com/your-username/dnsmasq-analyzer/issues)
-- 功能建议？欢迎在 [Discussions](https://github.com/your-username/dnsmasq-analyzer/discussions) 中讨论
-
-## ⭐ 如果这个项目对您有帮助，请给个Star！
 
 ## 📄 许可证
 

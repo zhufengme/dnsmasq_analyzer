@@ -8,7 +8,8 @@
       "Bash(./cleanup_data.sh:*)",
       "WebFetch(domain:www.gnu.org)",
       "Bash(git add:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(git commit:*)"
     ],
     "defaultMode": "acceptEdits",
     "additionalDirectories": [
