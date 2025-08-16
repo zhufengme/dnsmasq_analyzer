@@ -55,6 +55,7 @@ class DnsmasqAnalyzer:
             'domain_counts': Counter(),
             'query_types': Counter(),
             'client_ips': Counter(),
+            'client_domains': defaultdict(Counter),  # 每个客户端的域名查询统计
             'hourly_stats': defaultdict(int),
             'cache_hits': 0,
             'cache_misses': 0,
@@ -319,6 +320,11 @@ class DnsmasqAnalyzer:
                 self.today_data['forwarded_domains'].update(existing_data.get('forwarded_domains', {}))
                 self.today_data['upstream_servers'].update(existing_data.get('upstream_servers', {}))
                 
+                # 恢复客户端域名统计
+                client_domains_data = existing_data.get('client_domains', {})
+                for client_ip, domains in client_domains_data.items():
+                    self.today_data['client_domains'][client_ip].update(domains)
+                
                 # 恢复小时统计
                 for hour, stats in existing_data.get('hourly_cache_stats', {}).items():
                     self.today_data['hourly_cache_stats'][int(hour)] = stats
@@ -571,6 +577,9 @@ class DnsmasqAnalyzer:
         # 获取最近24小时最活跃的域名
         top_domains_24h = self.today_data['domain_counts'].most_common(20)
         
+        # 获取查询量最高的5个客户端及其高频域名
+        top_clients_with_domains = self.get_top_clients_with_domains(5, 10)
+        
         # 加载历史数据进行对比
         historical_data = self.load_historical_data(7)
         historical_averages = self.calculate_historical_averages(historical_data)
@@ -578,7 +587,7 @@ class DnsmasqAnalyzer:
         # 构建分析提示
         prompt = self.build_analysis_prompt(
             current_hour_queries, last_hour_queries, top_domains_24h, 
-            historical_averages, current_hour
+            historical_averages, current_hour, top_clients_with_domains
         )
         
         # 调用AI分析
@@ -636,7 +645,7 @@ class DnsmasqAnalyzer:
         }
     
     def build_analysis_prompt(self, current_hour_queries, last_hour_queries, 
-                            top_domains, historical_averages, current_hour):
+                            top_domains, historical_averages, current_hour, top_clients_with_domains=None):
         """构建AI分析提示"""
         
         # 计算查询变化率
@@ -671,12 +680,26 @@ class DnsmasqAnalyzer:
         for i, (domain, count) in enumerate(top_domains[:10], 1):
             prompt += f"{i}. {domain}: {count:,} 次查询\n"
         
+        # 添加客户端域名分析数据
+        if top_clients_with_domains:
+            prompt += f"\n最活跃的5个客户端及其高频域名：\n"
+            for i, client_data in enumerate(top_clients_with_domains, 1):
+                client_ip = client_data['client_ip']
+                total_queries = client_data['total_queries']
+                top_domains_client = client_data['top_domains'][:5]  # 只显示前5个域名
+                
+                prompt += f"{i}. {client_ip} ({total_queries:,} 次查询):\n"
+                for j, (domain, count) in enumerate(top_domains_client, 1):
+                    percentage = (count / total_queries * 100) if total_queries > 0 else 0
+                    prompt += f"   {j}. {domain}: {count:,} 次 ({percentage:.1f}%)\n"
+        
         prompt += f"""
 请基于以上数据提供态势感知分析，包括：
 1. 查询量趋势分析（是否异常）
 2. 域名访问模式识别
-3. 可能的安全风险或异常行为
-4. 简要的安全建议
+3. 客户端行为分析（是否有异常集中或可疑活动）
+4. 可能的安全风险或异常行为
+5. 简要的安全建议
 
 请用简洁的中文回答，重点突出异常情况和安全关注点。如果一切正常，请说明当前网络活动正常。请使用纯文本格式输出，便于直接显示。
 """
@@ -719,6 +742,7 @@ class DnsmasqAnalyzer:
                                 self.today_data['domain_counts'][data['domain']] += 1
                                 self.today_data['query_types'][data['query_type']] += 1
                                 self.today_data['client_ips'][data['client_ip']] += 1
+                                self.today_data['client_domains'][data['client_ip']][data['domain']] += 1
                                 self.today_data['hourly_stats'][data['hour']] += 1
                         
                         # 处理缓存命中记录
@@ -793,6 +817,7 @@ class DnsmasqAnalyzer:
             'domain_counts': dict(self.today_data['domain_counts']),
             'query_types': dict(self.today_data['query_types']),
             'client_ips': dict(self.today_data['client_ips']),
+            'client_domains': {ip: dict(domains) for ip, domains in self.today_data['client_domains'].items()},
             'hourly_stats': dict(self.today_data['hourly_stats']),
             'top_domains': dict(self.today_data['domain_counts'].most_common(100)),
             'cache_hits': self.today_data['cache_hits'],
@@ -878,6 +903,25 @@ class DnsmasqAnalyzer:
         
         return total_size, file_count
     
+    def get_top_clients_with_domains(self, top_clients_count=5, top_domains_count=10):
+        """获取查询量最高的客户端及其查询量最高的域名"""
+        # 获取查询量最高的客户端
+        top_clients = self.today_data['client_ips'].most_common(top_clients_count)
+        
+        result = []
+        for client_ip, total_queries in top_clients:
+            # 获取该客户端查询最高的域名
+            client_domains = self.today_data['client_domains'][client_ip]
+            top_domains = client_domains.most_common(top_domains_count)
+            
+            result.append({
+                'client_ip': client_ip,
+                'total_queries': total_queries,
+                'top_domains': top_domains
+            })
+        
+        return result
+    
     def load_historical_data(self, days=7):
         """加载历史数据"""
         historical_data = []
@@ -898,6 +942,9 @@ class DnsmasqAnalyzer:
         """生成HTML分析报告"""
         # 获取最近24小时的TOP域名
         top_domains_24h = self.today_data['domain_counts'].most_common(50)
+        
+        # 获取查询量最高的5个客户端及其TOP 10域名
+        top_clients_with_domains = self.get_top_clients_with_domains(5, 10)
         
         # 计算缓存命中率
         total_lookups = self.today_data['cache_hits'] + self.today_data['cache_misses']
@@ -1416,6 +1463,51 @@ class DnsmasqAnalyzer:
                         <div class="value">{}</div>
                     </div>
                 </div>
+            </div>
+        </div>
+        
+        <!-- TOP 5 客户端及其高频域名 -->
+        <div class="card" style="grid-column: 1 / -1;">
+            <h2>🔥 查询量最高的5个客户端及其TOP 10域名</h2>
+            <div class="main-content" style="grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));">
+"""
+        
+        # 添加每个客户端的卡片
+        for idx, client_data in enumerate(top_clients_with_domains, 1):
+            client_ip = client_data['client_ip']
+            total_queries = client_data['total_queries']
+            top_domains = client_data['top_domains']
+            
+            html_content += f"""
+                <div class="card" style="margin: 0;">
+                    <h3 style="color: #667eea; margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
+                        <span class="domain-rank" style="font-size: 14px;">{idx}</span>
+                        {client_ip}
+                        <span style="font-size: 14px; color: #666; font-weight: normal;">({total_queries:,} 次查询)</span>
+                    </h3>
+                    <div class="domain-list" style="max-height: 350px;">
+"""
+            
+            # 添加该客户端的TOP域名
+            for domain_idx, (domain, count) in enumerate(top_domains, 1):
+                percentage = (count / total_queries * 100) if total_queries > 0 else 0
+                html_content += f"""
+                        <div class="domain-item">
+                            <span class="domain-rank" style="width: 25px; height: 25px; line-height: 25px; font-size: 12px;">{domain_idx}</span>
+                            <span class="domain-name" style="font-size: 14px;">{domain}</span>
+                            <div style="display: flex; flex-direction: column; align-items: flex-end;">
+                                <span class="domain-count" style="background: #28a745;">{count:,}</span>
+                                <small style="color: #666; font-size: 11px; margin-top: 2px;">{percentage:.1f}%</small>
+                            </div>
+                        </div>
+"""
+            
+            html_content += """
+                    </div>
+                </div>
+"""
+        
+        html_content += """
             </div>
         </div>
         
