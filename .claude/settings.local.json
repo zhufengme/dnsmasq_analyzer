@@ -6,8 +6,13 @@
       "Bash(rm:*)",
       "Bash(grep:*)",
       "Bash(./cleanup_data.sh:*)",
-      "WebFetch(domain:www.gnu.org)"
+      "WebFetch(domain:www.gnu.org)",
+      "Bash(git add:*)",
+      "Bash(git push:*)"
     ],
-    "defaultMode": "acceptEdits"
+    "defaultMode": "acceptEdits",
+    "additionalDirectories": [
+      "/var/log"
+    ]
   }
 }

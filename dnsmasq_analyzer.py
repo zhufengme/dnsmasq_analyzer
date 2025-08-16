@@ -8,6 +8,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import argparse
 import sys
+import requests
+import hashlib
 
 class DnsmasqAnalyzer:
     def __init__(self, log_file='/var/log/dnsmasq.log', data_dir='./dnsmasq_data', keep_days=30, exclude_arpa=True):
@@ -16,6 +18,10 @@ class DnsmasqAnalyzer:
         self.data_dir.mkdir(exist_ok=True)
         self.keep_days = keep_days  # 保留天数，默认30天
         self.exclude_arpa = exclude_arpa  # 是否排除.arpa域名
+        
+        # DeepSeek AI配置
+        self.deepseek_api_key = self.load_deepseek_config()
+        self.deepseek_api_base = "https://api.deepseek.com/v1"
         
         # 状态文件，记录上次处理的位置
         self.state_file = self.data_dir / '.last_processed_state.json'
@@ -66,6 +72,83 @@ class DnsmasqAnalyzer:
         # 加载今天已有的数据（如果存在）
         self.load_existing_data()
         
+    def load_deepseek_config(self):
+        """加载DeepSeek API配置"""
+        # 按优先级依次检查配置源
+        
+        # 1. 环境变量
+        api_key = os.getenv('DEEPSEEK_API_KEY')
+        if api_key:
+            return api_key
+        
+        # 2. 配置文件
+        config_paths = [
+            self.data_dir / 'deepseek_config.json',
+            Path.home() / '.config' / 'dnsmasq_analyzer' / 'deepseek_config.json',
+            Path('/etc/dnsmasq_analyzer/deepseek_config.json')
+        ]
+        
+        for config_path in config_paths:
+            if config_path.exists():
+                try:
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                        if 'api_key' in config:
+                            return config['api_key']
+                except Exception as e:
+                    print(f"读取配置文件失败 {config_path}: {e}")
+        
+        return None
+    
+    def setup_deepseek_config(self, api_key=None):
+        """设置DeepSeek API配置"""
+        if api_key is None:
+            # 交互式设置
+            print("\n=== DeepSeek AI 配置设置 ===")
+            print("请按照以下步骤获取API密钥：")
+            print("1. 访问 https://platform.deepseek.com/")
+            print("2. 注册并登录账户")
+            print("3. 在控制台创建API密钥")
+            print("4. 复制API密钥并粘贴到下方")
+            print()
+            
+            api_key = input("请输入您的DeepSeek API密钥: ").strip()
+        
+        if not api_key:
+            print("❌ API密钥不能为空")
+            return False
+        
+        # 验证API密钥格式
+        if not api_key.startswith('sk-'):
+            print("⚠️ 警告：API密钥格式可能不正确，通常以 'sk-' 开头")
+        
+        # 保存配置
+        config_dir = self.data_dir
+        config_file = config_dir / 'deepseek_config.json'
+        
+        config = {
+            'api_key': api_key,
+            'created_at': datetime.now().isoformat(),
+            'api_base': self.deepseek_api_base
+        }
+        
+        try:
+            with open(config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            # 设置文件权限为只有用户可读写
+            os.chmod(config_file, 0o600)
+            
+            print(f"✅ 配置已保存到: {config_file}")
+            print("💡 提示：您也可以设置环境变量 DEEPSEEK_API_KEY 来配置API密钥")
+            
+            self.deepseek_api_key = api_key
+            return True
+            
+        except Exception as e:
+            print(f"❌ 保存配置失败: {e}")
+            return False
+
     def is_arpa_domain(self, domain):
         """检查是否为.arpa域名（反向DNS查询）"""
         return domain.endswith('.arpa')
@@ -259,8 +342,6 @@ class DnsmasqAnalyzer:
     
     def get_line_hash(self, line):
         """生成日志行的唯一标识符（包含时间戳和文件位置信息增强唯一性）"""
-        import hashlib
-        
         # 提取时间戳信息以增强唯一性
         timestamp_info = ""
         parsed_data = self.parse_log_line(line)
@@ -270,6 +351,184 @@ class DnsmasqAnalyzer:
         # 结合原始行内容、时间戳和行长度创建更强的唯一标识
         unique_string = f"{line.strip()}|{timestamp_info}|{len(line)}"
         return hashlib.sha256(unique_string.encode()).hexdigest()[:32]  # 使用SHA256并截取前32位
+    
+    def call_deepseek_api(self, prompt, max_tokens=1000):
+        """调用DeepSeek API进行AI分析"""
+        if not self.deepseek_api_key:
+            return None
+        
+        headers = {
+            'Authorization': f'Bearer {self.deepseek_api_key}',
+            'Content-Type': 'application/json'
+        }
+        
+        data = {
+            'model': 'deepseek-chat',
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': '你是一个专业的网络安全分析师，专门分析DNS查询日志，识别异常行为和潜在威胁。请用中文回答，语言简洁明了。'
+                },
+                {
+                    'role': 'user',
+                    'content': prompt
+                }
+            ],
+            'max_tokens': max_tokens,
+            'temperature': 0.7
+        }
+        
+        try:
+            response = requests.post(
+                f"{self.deepseek_api_base}/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'choices' in result and len(result['choices']) > 0:
+                    return result['choices'][0]['message']['content']
+            else:
+                print(f"DeepSeek API错误: {response.status_code} - {response.text}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"DeepSeek API请求失败: {e}")
+            return None
+        except Exception as e:
+            print(f"DeepSeek API调用异常: {e}")
+            return None
+    
+    def analyze_dns_anomalies(self):
+        """分析DNS查询异常"""
+        if not self.deepseek_api_key:
+            return {"status": "no_api_key", "message": "未配置DeepSeek API密钥"}
+        
+        # 获取当前小时和最近1小时的数据
+        now = datetime.now()
+        current_hour = now.hour
+        last_hour = (now - timedelta(hours=1)).hour
+        
+        # 分析最近1小时的查询突增
+        current_hour_queries = self.today_data['hourly_stats'].get(current_hour, 0)
+        last_hour_queries = self.today_data['hourly_stats'].get(last_hour, 0)
+        
+        # 获取最近24小时最活跃的域名
+        top_domains_24h = self.today_data['domain_counts'].most_common(20)
+        
+        # 加载历史数据进行对比
+        historical_data = self.load_historical_data(7)
+        historical_averages = self.calculate_historical_averages(historical_data)
+        
+        # 构建分析提示
+        prompt = self.build_analysis_prompt(
+            current_hour_queries, last_hour_queries, top_domains_24h, 
+            historical_averages, current_hour
+        )
+        
+        # 调用AI分析
+        ai_analysis = self.call_deepseek_api(prompt)
+        
+        if ai_analysis:
+            return {
+                "status": "success",
+                "analysis": ai_analysis,
+                "timestamp": now.isoformat(),
+                "data_summary": {
+                    "current_hour_queries": current_hour_queries,
+                    "last_hour_queries": last_hour_queries,
+                    "top_domains_count": len(top_domains_24h),
+                    "total_domains_24h": len(self.today_data['domain_counts'])
+                }
+            }
+        else:
+            return {"status": "api_error", "message": "AI分析调用失败"}
+    
+    def calculate_historical_averages(self, historical_data):
+        """计算历史数据平均值"""
+        if not historical_data:
+            return {}
+        
+        total_queries = []
+        hourly_averages = defaultdict(list)
+        domain_averages = defaultdict(list)
+        
+        for data in historical_data:
+            if data.get('date') != datetime.now().strftime('%Y-%m-%d'):  # 排除今天
+                total_queries.append(data.get('total_queries', 0))
+                
+                # 收集小时数据
+                hourly_data = data.get('hourly_stats', {})
+                for hour, count in hourly_data.items():
+                    hourly_averages[int(hour)].append(count)
+                
+                # 收集域名数据
+                domain_data = data.get('domain_counts', {})
+                for domain, count in domain_data.items():
+                    domain_averages[domain].append(count)
+        
+        # 计算平均值
+        avg_total = sum(total_queries) / len(total_queries) if total_queries else 0
+        
+        avg_hourly = {}
+        for hour, counts in hourly_averages.items():
+            avg_hourly[hour] = sum(counts) / len(counts) if counts else 0
+        
+        return {
+            'avg_total_queries': avg_total,
+            'avg_hourly': avg_hourly,
+            'historical_days': len(total_queries)
+        }
+    
+    def build_analysis_prompt(self, current_hour_queries, last_hour_queries, 
+                            top_domains, historical_averages, current_hour):
+        """构建AI分析提示"""
+        
+        # 计算查询变化率
+        if last_hour_queries > 0:
+            change_rate = ((current_hour_queries - last_hour_queries) / last_hour_queries) * 100
+        else:
+            change_rate = 100 if current_hour_queries > 0 else 0
+        
+        # 获取历史平均值进行对比
+        hist_avg_current = historical_averages.get('avg_hourly', {}).get(current_hour, 0)
+        hist_avg_last = historical_averages.get('avg_hourly', {}).get((current_hour-1) % 24, 0)
+        
+        prompt = f"""
+请分析以下DNS查询数据，提供态势感知描述：
+
+时间信息：
+- 当前时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (第{current_hour}小时)
+- 分析时段：最近1小时
+
+查询量统计：
+- 当前小时查询量：{current_hour_queries:,} 次
+- 上一小时查询量：{last_hour_queries:,} 次
+- 变化率：{change_rate:+.1f}%
+
+历史对比（基于过去{historical_averages.get('historical_days', 0)}天数据）：
+- 当前小时历史平均：{hist_avg_current:.0f} 次
+- 上一小时历史平均：{hist_avg_last:.0f} 次
+
+最近24小时TOP域名：
+"""
+        
+        for i, (domain, count) in enumerate(top_domains[:10], 1):
+            prompt += f"{i}. {domain}: {count:,} 次查询\n"
+        
+        prompt += f"""
+请基于以上数据提供态势感知分析，包括：
+1. 查询量趋势分析（是否异常）
+2. 域名访问模式识别
+3. 可能的安全风险或异常行为
+4. 简要的安全建议
+
+请用简洁的中文回答，重点突出异常情况和安全关注点。如果一切正常，请说明当前网络活动正常。
+"""
+        
+        return prompt
     
     def analyze_log(self):
         """分析日志文件"""
@@ -495,6 +754,9 @@ class DnsmasqAnalyzer:
         top_cached = self.today_data['cached_domains'].most_common(10)
         top_forwarded = self.today_data['forwarded_domains'].most_common(10)
         
+        # 执行AI态势感知分析
+        ai_analysis_result = self.analyze_dns_anomalies()
+        
         # 加载7天的历史数据（不包括今天）
         historical_data = self.load_historical_data(7)
         
@@ -581,6 +843,44 @@ class DnsmasqAnalyzer:
         .header .update-time {{
             font-size: 1.1em;
             opacity: 0.9;
+        }}
+        
+        .ai-analysis {{
+            background: linear-gradient(135deg, #ff9a9e 0%, #fecfef 50%, #fecfef 100%);
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 30px;
+            color: #333;
+            box-shadow: 0 15px 35px rgba(255, 154, 158, 0.3);
+        }}
+        
+        .ai-analysis h2 {{
+            color: #d63384;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .ai-analysis .content {{
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 10px;
+            padding: 20px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }}
+        
+        .ai-analysis .no-analysis {{
+            text-align: center;
+            padding: 20px;
+            color: #666;
+            font-style: italic;
+        }}
+        
+        .ai-analysis .error {{
+            background: rgba(220, 53, 69, 0.1);
+            border: 1px solid rgba(220, 53, 69, 0.3);
+            color: #721c24;
         }}
         
         .stats-grid {{
@@ -789,6 +1089,29 @@ class DnsmasqAnalyzer:
             <div class="update-time">更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
         </div>
         
+        <!-- AI态势感知分析 -->
+        <div class="ai-analysis">
+            <h2>🤖 AI态势感知分析</h2>"""
+
+        if ai_analysis_result['status'] == 'success':
+            html_content += f"""
+            <div class="content">{ai_analysis_result['analysis']}</div>"""
+        elif ai_analysis_result['status'] == 'no_api_key':
+            html_content += f"""
+            <div class="no-analysis">
+                💡 未配置DeepSeek API密钥，无法进行AI分析<br>
+                运行 <code>python3 dnsmasq_analyzer.py --setup-ai</code> 进行配置
+            </div>"""
+        else:
+            html_content += f"""
+            <div class="content error">
+                ⚠️ AI分析暂时不可用: {ai_analysis_result.get('message', '未知错误')}<br>
+                请检查网络连接和API配置
+            </div>"""
+        
+        html_content += f"""
+        </div>
+        
         <div class="stats-grid">
             <div class="stat-card">
                 <h3>24小时查询总数</h3>
@@ -994,6 +1317,12 @@ def main():
                        help='仅执行数据清理，不进行日志分析')
     parser.add_argument('--include-arpa', action='store_true',
                        help='包含.arpa域名查询 (默认排除反向DNS查询)')
+    parser.add_argument('--setup-ai', action='store_true',
+                       help='配置DeepSeek AI分析功能')
+    parser.add_argument('--api-key', type=str,
+                       help='直接设置DeepSeek API密钥')
+    parser.add_argument('--test-ai', action='store_true',
+                       help='测试DeepSeek AI连接')
     
     args = parser.parse_args()
     
@@ -1002,6 +1331,41 @@ def main():
     print("=" * 50)
     
     analyzer = DnsmasqAnalyzer(log_file=args.log, data_dir=args.data_dir, keep_days=args.keep_days, exclude_arpa=not args.include_arpa)
+    
+    # 命令行直接设置API密钥
+    if args.api_key:
+        print("\n正在设置DeepSeek API密钥...")
+        if analyzer.setup_deepseek_config(api_key=args.api_key):
+            print("✅ API密钥设置成功!")
+        else:
+            print("❌ API密钥设置失败!")
+        return
+    
+    # AI配置模式（交互式）
+    if args.setup_ai:
+        print("\n正在配置DeepSeek AI分析功能...")
+        if analyzer.setup_deepseek_config():
+            print("✅ AI功能配置完成!")
+        else:
+            print("❌ AI功能配置失败!")
+        return
+    
+    # AI测试模式
+    if args.test_ai:
+        print("\n正在测试DeepSeek AI连接...")
+        if not analyzer.deepseek_api_key:
+            print("❌ 未配置API密钥，请先运行 --setup-ai 进行配置")
+            return
+        
+        test_prompt = "请简单介绍一下DNS协议的作用，用一句话回答。"
+        result = analyzer.call_deepseek_api(test_prompt, max_tokens=100)
+        
+        if result:
+            print("✅ DeepSeek API连接成功!")
+            print(f"测试响应: {result}")
+        else:
+            print("❌ DeepSeek API连接失败，请检查API密钥和网络连接")
+        return
     
     # 如果只是清理模式
     if args.cleanup_only:
@@ -1027,6 +1391,12 @@ def main():
         print(f"📊 共分析 {len(analyzer.today_data['queries'])} 条查询记录")
         print(f"📁 历史数据保存在: {args.data_dir}")
         print(f"📄 HTML报告: {args.output}")
+        
+        # AI功能状态提示
+        if analyzer.deepseek_api_key:
+            print("🤖 AI态势感知分析已集成到HTML报告中")
+        else:
+            print("💡 未配置AI功能，运行 'python3 dnsmasq_analyzer.py --setup-ai' 启用智能分析")
     else:
         print("\n❌ 分析失败，请检查日志文件是否存在且有读取权限")
         sys.exit(1)

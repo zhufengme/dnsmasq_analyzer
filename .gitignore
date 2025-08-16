@@ -166,6 +166,21 @@ test*.html
 *.tmp
 *.temp
 
+# Generated reports and data
+dnsmasq_report.html
+*_report*.html
+dns_data_*.json
+.last_processed_state.json
+
+# API configuration files (sensitive)
+deepseek_config.json
+*/deepseek_config.json
+
+# Large log files
+*.log.1
+*.log.2
+dnsmasq.log*
+
 # OS generated files
 .DS_Store
 .DS_Store?
